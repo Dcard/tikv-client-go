@@ -57,7 +57,7 @@ func TestBackoffErrorType(t *testing.T) {
 	assert.Nil(t, err)
 	// 6ms sleep at most in total
 	for i := 0; i < 2; i++ {
-		err = b.Backoff(BoMaxDataNotReady, errors.New("data not ready"))
+		err = b.Backoff(BoMaxRegionNotInitialized, errors.New("region not initialized"))
 		assert.Nil(t, err)
 	}
 	// 100ms sleep at most in total
@@ -71,11 +71,12 @@ func TestBackoffErrorType(t *testing.T) {
 	err = b.Backoff(BoIsWitness, errors.New("peer is witness"))
 	assert.Nil(t, err)
 	// wait it exceed max sleep
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 15; i++ {
 		err = b.Backoff(BoTxnNotFound, errors.New("txn not found"))
 		if err != nil {
 			// Next backoff should return error of backoff that sleeps for longest time.
-			assert.ErrorIs(t, err, BoTxnNotFound.err)
+			cfg, _ := b.longestSleepCfg()
+			assert.ErrorIs(t, err, cfg.err)
 			return
 		}
 	}
@@ -87,7 +88,7 @@ func TestBackoffDeepCopy(t *testing.T) {
 	b := NewBackofferWithVars(context.TODO(), 4, nil)
 	// 700 ms sleep in total and the backoffer will return an error next time.
 	for i := 0; i < 3; i++ {
-		err = b.Backoff(BoMaxDataNotReady, errors.New("data not ready"))
+		err = b.Backoff(BoMaxRegionNotInitialized, errors.New("region not initialized"))
 		assert.Nil(t, err)
 	}
 	bForked, cancel := b.Fork()
@@ -95,6 +96,18 @@ func TestBackoffDeepCopy(t *testing.T) {
 	bCloned := b.Clone()
 	for _, b := range []*Backoffer{bForked, bCloned} {
 		err = b.Backoff(BoTiKVRPC, errors.New("tikv rpc"))
-		assert.ErrorIs(t, err, BoMaxDataNotReady.err)
+		assert.ErrorIs(t, err, BoMaxRegionNotInitialized.err)
 	}
+}
+
+func TestBackoffWithMaxExcludedExceed(t *testing.T) {
+	setBackoffExcluded(BoTiKVServerBusy.name, 1)
+	b := NewBackofferWithVars(context.TODO(), 1, nil)
+	err := b.Backoff(BoTiKVServerBusy, errors.New("server is busy"))
+	assert.Nil(t, err)
+
+	// As the total excluded sleep is greater than the max limited value, error should be returned.
+	err = b.Backoff(BoTiKVServerBusy, errors.New("server is busy"))
+	assert.NotNil(t, err)
+	assert.Greater(t, b.excludedSleep, b.maxSleep)
 }

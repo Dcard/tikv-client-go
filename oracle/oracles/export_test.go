@@ -35,10 +35,13 @@
 package oracles
 
 import (
+	"context"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/tikv/client-go/v2/oracle"
+	pd "github.com/tikv/pd/client"
 )
 
 // SetOracleHookCurrentTime exports localOracle's time hook to test.
@@ -59,24 +62,31 @@ func NewEmptyPDOracle() oracle.Oracle {
 	return &pdOracle{}
 }
 
+func NewPdOracleWithClient(client pd.Client) oracle.Oracle {
+	return &pdOracle{
+		c: client,
+	}
+}
+
+func StartTsUpdateLoop(o oracle.Oracle, ctx context.Context, wg *sync.WaitGroup) {
+	pd, ok := o.(*pdOracle)
+	if !ok {
+		panic("expected pdOracle")
+	}
+	pd.quit = make(chan struct{})
+	wg.Add(1)
+	go func() {
+		pd.updateTS(ctx)
+		wg.Done()
+	}()
+}
+
 // SetEmptyPDOracleLastTs exports PD oracle's global last ts to test.
 func SetEmptyPDOracleLastTs(oc oracle.Oracle, ts uint64) {
 	switch o := oc.(type) {
 	case *pdOracle:
-		lastTSInterface, _ := o.lastTSMap.LoadOrStore(oracle.GlobalTxnScope, new(uint64))
-		lastTSPointer := lastTSInterface.(*uint64)
-		atomic.StoreUint64(lastTSPointer, ts)
-		lasTSArrivalInterface, _ := o.lastArrivalTSMap.LoadOrStore(oracle.GlobalTxnScope, new(uint64))
-		lasTSArrivalPointer := lasTSArrivalInterface.(*uint64)
-		atomic.StoreUint64(lasTSArrivalPointer, uint64(time.Now().Unix()*1000))
-	}
-	setEmptyPDOracleLastArrivalTs(oc, ts)
-}
-
-// setEmptyPDOracleLastArrivalTs exports PD oracle's global last ts to test.
-func setEmptyPDOracleLastArrivalTs(oc oracle.Oracle, ts uint64) {
-	switch o := oc.(type) {
-	case *pdOracle:
-		o.setLastArrivalTS(ts, oracle.GlobalTxnScope)
+		lastTSInterface, _ := o.lastTSMap.LoadOrStore(oracle.GlobalTxnScope, &atomic.Pointer[lastTSO]{})
+		lastTSPointer := lastTSInterface.(*atomic.Pointer[lastTSO])
+		lastTSPointer.Store(&lastTSO{tso: ts, arrival: oracle.GetTimeFromTS(ts)})
 	}
 }

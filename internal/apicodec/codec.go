@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 
 	"github.com/pingcap/errors"
+	"github.com/pingcap/kvproto/pkg/keyspacepb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/tikv/client-go/v2/tikvrpc"
 )
@@ -48,6 +49,8 @@ type Codec interface {
 	GetKeyspace() []byte
 	// GetKeyspaceID return the keyspace id of the codec.
 	GetKeyspaceID() KeyspaceID
+	// GetKeyspaceMeta return the keyspace meta of the codec.
+	GetKeyspaceMeta() *keyspacepb.KeyspaceMeta
 	// EncodeRequest encodes with the given Codec.
 	// NOTE: req is reused on retry. MUST encode on cloned request, other than overwrite the original.
 	EncodeRequest(req *tikvrpc.Request) (*tikvrpc.Request, error)
@@ -88,32 +91,24 @@ func DecodeKey(encoded []byte, version kvrpcpb.APIVersion) ([]byte, []byte, erro
 	return nil, nil, errors.Errorf("unsupported api version %s", version.String())
 }
 
-func attachAPICtx(c Codec, req *tikvrpc.Request) *tikvrpc.Request {
-	// Shallow copy the request to avoid concurrent modification.
-	r := *req
-
-	ctx := &r.Context
-	ctx.ApiVersion = c.GetAPIVersion()
-	ctx.KeyspaceId = uint32(c.GetKeyspaceID())
+func setAPICtx(c Codec, r *tikvrpc.Request) {
+	r.Context.ApiVersion = c.GetAPIVersion()
+	r.Context.KeyspaceId = uint32(c.GetKeyspaceID())
 
 	switch r.Type {
 	case tikvrpc.CmdMPPTask:
 		mpp := *r.DispatchMPPTask()
 		// Shallow copy the meta to avoid concurrent modification.
 		meta := *mpp.Meta
-		meta.KeyspaceId = ctx.KeyspaceId
-		meta.ApiVersion = ctx.ApiVersion
+		meta.KeyspaceId = r.Context.KeyspaceId
+		meta.ApiVersion = r.Context.ApiVersion
 		mpp.Meta = &meta
 		r.Req = &mpp
 
 	case tikvrpc.CmdCompact:
 		compact := *r.Compact()
-		compact.KeyspaceId = ctx.KeyspaceId
-		compact.ApiVersion = ctx.ApiVersion
+		compact.KeyspaceId = r.Context.KeyspaceId
+		compact.ApiVersion = r.Context.ApiVersion
 		r.Req = &compact
 	}
-
-	tikvrpc.AttachContext(&r, ctx)
-
-	return &r
 }

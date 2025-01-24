@@ -20,8 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tikv/client-go/v2/config/retry"
 	"github.com/tikv/client-go/v2/internal/locate"
-	"github.com/tikv/client-go/v2/internal/retry"
 	"github.com/tikv/client-go/v2/internal/unionstore"
 	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/tikvrpc"
@@ -36,11 +36,6 @@ type TxnProbe struct {
 // SetStartTS resets the txn's start ts.
 func (txn TxnProbe) SetStartTS(ts uint64) {
 	txn.startTS = ts
-}
-
-// GetCommitTS returns the commit ts.
-func (txn TxnProbe) GetCommitTS() uint64 {
-	return txn.commitTS
 }
 
 // GetUnionStore returns transaction's embedded unionstore.
@@ -157,6 +152,11 @@ type CommitterProbe struct {
 	*twoPhaseCommitter
 }
 
+// IsNil returns whether tie internal twoPhaseCommitter is nil.
+func (c CommitterProbe) IsNil() bool {
+	return c.twoPhaseCommitter == nil
+}
+
 // InitKeysAndMutations prepares the committer for commit.
 func (c CommitterProbe) InitKeysAndMutations() error {
 	return c.initKeysAndMutations(context.Background())
@@ -194,12 +194,12 @@ func (c CommitterProbe) GetCommitTS() uint64 {
 
 // GetMinCommitTS returns the minimal commit ts can be used.
 func (c CommitterProbe) GetMinCommitTS() uint64 {
-	return c.minCommitTS
+	return c.minCommitTSMgr.get()
 }
 
 // SetMinCommitTS sets the minimal commit ts can be used.
 func (c CommitterProbe) SetMinCommitTS(ts uint64) {
-	c.minCommitTS = ts
+	c.minCommitTSMgr.tryUpdate(ts, twoPCAccess)
 }
 
 // SetMaxCommitTS sets the max commit ts can be used.
@@ -289,6 +289,11 @@ func (c CommitterProbe) Cleanup(ctx context.Context) {
 	c.cleanWg.Wait()
 }
 
+// CleanupWithoutWait cleans dirty data of a committer without waiting.
+func (c CommitterProbe) CleanupWithoutWait(ctx context.Context) {
+	c.cleanup(ctx)
+}
+
 // WaitCleanup waits for the committer to complete.
 func (c CommitterProbe) WaitCleanup() {
 	c.cleanWg.Wait()
@@ -369,9 +374,14 @@ func (c CommitterProbe) CleanupMutations(ctx context.Context) error {
 	return c.cleanupMutations(bo, c.mutations)
 }
 
+// ResolveFlushedLocks exports resolveFlushedLocks
+func (c CommitterProbe) ResolveFlushedLocks(bo *retry.Backoffer, start, end []byte, commit bool) {
+	c.resolveFlushedLocks(bo, start, end, commit)
+}
+
 // SendTxnHeartBeat renews a txn's ttl.
 func SendTxnHeartBeat(bo *retry.Backoffer, store kvstore, primary []byte, startTS, ttl uint64) (newTTL uint64, stopHeartBeat bool, err error) {
-	return sendTxnHeartBeat(bo, store, primary, startTS, ttl)
+	return sendTxnHeartBeat(bo, store, primary, startTS, ttl, 0)
 }
 
 // ConfigProbe exposes configurations and global variables for testing purpose.

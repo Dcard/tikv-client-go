@@ -36,6 +36,7 @@ package oracles
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 
@@ -93,6 +94,17 @@ func (o *MockOracle) GetTimestamp(ctx context.Context, _ *oracle.Option) (uint64
 	return ts, nil
 }
 
+// GetAllTSOKeyspaceGroupMinTS implements oracle.Oracle interface.
+func (o *MockOracle) GetAllTSOKeyspaceGroupMinTS(ctx context.Context) (uint64, error) {
+	o.RLock()
+	defer o.RUnlock()
+
+	if o.stop {
+		return 0, errors.WithStack(errStopped)
+	}
+	return oracle.GoTimeToTS(time.Now().Add(o.offset)), nil
+}
+
 // GetStaleTimestamp implements oracle.Oracle interface.
 func (o *MockOracle) GetStaleTimestamp(ctx context.Context, txnScope string, prevSecond uint64) (ts uint64, err error) {
 	return oracle.GoTimeToTS(time.Now().Add(-time.Second * time.Duration(prevSecond))), nil
@@ -120,6 +132,31 @@ func (o *MockOracle) GetLowResolutionTimestamp(ctx context.Context, opt *oracle.
 // GetLowResolutionTimestampAsync implements oracle.Oracle interface.
 func (o *MockOracle) GetLowResolutionTimestampAsync(ctx context.Context, opt *oracle.Option) oracle.Future {
 	return o.GetTimestampAsync(ctx, opt)
+}
+
+func (o *MockOracle) SetLowResolutionTimestampUpdateInterval(time.Duration) error {
+	return nil
+}
+
+func (o *MockOracle) ValidateReadTS(ctx context.Context, readTS uint64, isStaleRead bool, opt *oracle.Option) error {
+	if readTS == math.MaxUint64 {
+		if isStaleRead {
+			return oracle.ErrLatestStaleRead{}
+		}
+		return nil
+	}
+
+	currentTS, err := o.GetTimestamp(ctx, opt)
+	if err != nil {
+		return errors.Errorf("fail to validate read timestamp: %v", err)
+	}
+	if currentTS < readTS {
+		return oracle.ErrFutureTSRead{
+			ReadTS:    readTS,
+			CurrentTS: currentTS,
+		}
+	}
+	return nil
 }
 
 // IsExpired implements oracle.Oracle interface.

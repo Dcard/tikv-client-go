@@ -35,9 +35,11 @@
 package retry
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -131,7 +133,7 @@ func (b *Backoffer) BackoffWithMaxSleepTxnLockFast(maxSleepMs int, err error) er
 // and never sleep more than maxSleepMs for each sleep.
 func (b *Backoffer) BackoffWithCfgAndMaxSleep(cfg *Config, maxSleepMs int, err error) error {
 	if strings.Contains(err.Error(), tikverr.MismatchClusterID) {
-		logutil.BgLogger().Fatal("critical error", zap.Error(err))
+		logutil.Logger(b.ctx).Fatal("critical error", zap.Error(err))
 	}
 	select {
 	case <-b.ctx.Done():
@@ -141,7 +143,13 @@ func (b *Backoffer) BackoffWithCfgAndMaxSleep(cfg *Config, maxSleepMs int, err e
 	if b.noop {
 		return err
 	}
-	if b.maxSleep > 0 && (b.totalSleep-b.excludedSleep) >= b.maxSleep {
+	maxBackoffTimeExceeded := (b.totalSleep - b.excludedSleep) >= b.maxSleep
+	maxExcludedTimeExceeded := false
+	if maxLimit, ok := isSleepExcluded[cfg.name]; ok {
+		maxExcludedTimeExceeded = b.excludedSleep >= maxLimit && b.excludedSleep >= b.maxSleep
+	}
+	maxTimeExceeded := maxBackoffTimeExceeded || maxExcludedTimeExceeded
+	if b.maxSleep > 0 && maxTimeExceeded {
 		longestSleepCfg, longestSleepTime := b.longestSleepCfg()
 		errMsg := fmt.Sprintf("%s backoffer.maxSleep %dms is exceeded, errors:", cfg.String(), b.maxSleep)
 		for i, err := range b.errors {
@@ -150,12 +158,25 @@ func (b *Backoffer) BackoffWithCfgAndMaxSleep(cfg *Config, maxSleepMs int, err e
 				errMsg += "\n" + err.Error()
 			}
 		}
+		var backoffDetail bytes.Buffer
+		totalTimes := 0
+		for name, times := range b.backoffTimes {
+			totalTimes += times
+			if backoffDetail.Len() > 0 {
+				backoffDetail.WriteString(", ")
+			}
+			backoffDetail.WriteString(name)
+			backoffDetail.WriteString(":")
+			backoffDetail.WriteString(strconv.Itoa(times))
+		}
+		errMsg += fmt.Sprintf("\ntotal-backoff-times: %v, backoff-detail: %v, maxBackoffTimeExceeded: %v, maxExcludedTimeExceeded: %v",
+			totalTimes, backoffDetail.String(), maxBackoffTimeExceeded, maxExcludedTimeExceeded)
 		returnedErr := err
 		if longestSleepCfg != nil {
 			errMsg += fmt.Sprintf("\nlongest sleep type: %s, time: %dms", longestSleepCfg.String(), longestSleepTime)
 			returnedErr = longestSleepCfg.err
 		}
-		logutil.BgLogger().Warn(errMsg)
+		logutil.Logger(b.ctx).Warn(errMsg)
 		// Use the backoff type that contributes most to the timeout to generate a MySQL error.
 		return errors.WithStack(returnedErr)
 	}
@@ -196,10 +217,9 @@ func (b *Backoffer) BackoffWithCfgAndMaxSleep(cfg *Config, maxSleepMs int, err e
 		atomic.AddInt64(&detail.BackoffCount, 1)
 	}
 
-	if b.vars != nil && b.vars.Killed != nil {
-		if atomic.LoadUint32(b.vars.Killed) == 1 {
-			return errors.WithStack(tikverr.ErrQueryInterrupted)
-		}
+	err2 := b.CheckKilled()
+	if err2 != nil {
+		return err2
 	}
 
 	var startTs interface{}
@@ -360,4 +380,18 @@ func (b *Backoffer) longestSleepCfg() (*Config, int) {
 		}
 	}
 	return nil, 0
+}
+
+func (b *Backoffer) CheckKilled() error {
+	if b.vars != nil && b.vars.Killed != nil {
+		killed := atomic.LoadUint32(b.vars.Killed)
+		if killed != 0 {
+			logutil.BgLogger().Info(
+				"backoff stops because a killed signal is received",
+				zap.Uint32("signal", killed),
+			)
+			return errors.WithStack(tikverr.ErrQueryInterruptedWithSignal{Signal: killed})
+		}
+	}
+	return nil
 }

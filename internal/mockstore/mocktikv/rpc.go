@@ -49,6 +49,7 @@ import (
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pkg/errors"
 	tikverr "github.com/tikv/client-go/v2/error"
+	"github.com/tikv/client-go/v2/internal/client"
 	"github.com/tikv/client-go/v2/tikvrpc"
 	"github.com/tikv/client-go/v2/util"
 )
@@ -269,7 +270,7 @@ func (h kvHandler) handleKvPessimisticRollback(req *kvrpcpb.PessimisticRollbackR
 			panic("KvPessimisticRollback: key not in region")
 		}
 	}
-	errs := h.mvccStore.PessimisticRollback(req.Keys, req.StartVersion, req.ForUpdateTs)
+	errs := h.mvccStore.PessimisticRollback(h.startKey, h.endKey, req.Keys, req.StartVersion, req.ForUpdateTs)
 	return &kvrpcpb.PessimisticRollbackResponse{
 		Errors: convertToKeyErrors(errs),
 	}
@@ -645,7 +646,7 @@ func (h kvHandler) handleSplitRegion(req *kvrpcpb.SplitRegionRequest) *kvrpcpb.S
 	resp := &kvrpcpb.SplitRegionResponse{Regions: make([]*metapb.Region, 0, len(keys)+1)}
 	for i, key := range keys {
 		k := NewMvccKey(key)
-		region, _, _ := h.cluster.GetRegionByKey(k)
+		region, _, _, _ := h.cluster.GetRegionByKey(k)
 		if bytes.Equal(region.GetStartKey(), key) {
 			continue
 		}
@@ -732,6 +733,8 @@ func (c *RPCClient) checkArgs(ctx context.Context, addr string) (*Session, error
 
 // SendRequest sends a request to mock cluster.
 func (c *RPCClient) SendRequest(ctx context.Context, addr string, req *tikvrpc.Request, timeout time.Duration) (*tikvrpc.Response, error) {
+	tikvrpc.AttachContext(req, req.Context)
+
 	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
 		span1 := span.Tracer().StartSpan("RPCClient.SendRequest", opentracing.ChildOf(span.Context()))
 		defer span1.Finish()
@@ -1095,3 +1098,6 @@ func (c *RPCClient) Close() error {
 func (c *RPCClient) CloseAddr(addr string) error {
 	return nil
 }
+
+// SetEventListener does nothing.
+func (c *RPCClient) SetEventListener(listener client.ClientEventListener) {}

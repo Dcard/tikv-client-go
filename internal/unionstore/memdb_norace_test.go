@@ -33,11 +33,11 @@
 // limitations under the License.
 
 //go:build !race
-// +build !race
 
 package unionstore
 
 import (
+	"context"
 	rand2 "crypto/rand"
 	"encoding/binary"
 	"math/rand"
@@ -59,36 +59,41 @@ func TestRandom(t *testing.T) {
 		rand2.Read(keys[i])
 	}
 
-	p1 := newMemDB()
+	rbtDB := newRbtDBWithContext()
+	artDB := newArtDBWithContext()
 	p2 := leveldb.New(comparer.DefaultComparer, 4*1024)
 	for _, k := range keys {
-		p1.Set(k, k)
+		rbtDB.Set(k, k)
+		artDB.Set(k, k)
 		_ = p2.Put(k, k)
 	}
 
-	require.Equal(p1.Len(), p2.Len())
-	require.Equal(p1.Size(), p2.Size())
+	require.Equal(rbtDB.Len(), p2.Len())
+	require.Equal(rbtDB.Size(), p2.Size())
+
+	require.Equal(artDB.Len(), p2.Len())
+	require.Equal(artDB.Size(), p2.Size())
 
 	rand.Shuffle(cnt, func(i, j int) { keys[i], keys[j] = keys[j], keys[i] })
 
 	for _, k := range keys {
 		op := rand.Float64()
 		if op < 0.35 {
-			p1.RemoveFromBuffer(k)
+			rbtDB.RemoveFromBuffer(k)
 			p2.Delete(k)
 		} else {
 			newValue := make([]byte, rand.Intn(19)+1)
 			rand2.Read(newValue)
-			p1.Set(k, newValue)
+			rbtDB.Set(k, newValue)
 			_ = p2.Put(k, newValue)
 		}
 	}
-	checkConsist(t, p1, p2)
+	checkConsist(t, rbtDB, p2)
 }
 
 // The test takes too long under the race detector.
 func TestRandomDerive(t *testing.T) {
-	db := newMemDB()
+	db := NewMemDB()
 	golden := leveldb.New(comparer.DefaultComparer, 4*1024)
 	testRandomDeriveRecur(t, db, golden, 0)
 }
@@ -160,4 +165,70 @@ func testRandomDeriveRecur(t *testing.T, db *MemDB, golden *leveldb.DB, depth in
 	}
 
 	return opLog
+}
+
+func TestRandomAB(t *testing.T) {
+	testRandomAB(t, newRbtDBWithContext(), newArtDBWithContext())
+}
+
+func testRandomAB(t *testing.T, bufferA, bufferB MemBuffer) {
+	require := require.New(t)
+
+	checkIters := func(iter1, iter2 Iterator, k []byte) {
+		for iter1.Valid() {
+			require.True(iter2.Valid())
+			require.Equal(iter1.Key(), iter2.Key())
+			require.Equal(iter1.Value(), iter2.Value())
+			require.Nil(iter1.Next())
+			require.Nil(iter2.Next())
+		}
+		require.False(iter2.Valid())
+	}
+
+	const cnt = 50000
+	keys := make([][]byte, cnt)
+	for i := 0; i < cnt; i++ {
+		h := bufferA.Staging()
+		require.Equal(h, bufferB.Staging())
+
+		keys[i] = make([]byte, rand.Intn(19)+1)
+		rand2.Read(keys[i])
+
+		bufferA.Set(keys[i], keys[i])
+		bufferB.Set(keys[i], keys[i])
+
+		if i%2 == 0 {
+			bufferA.Cleanup(h)
+			bufferB.Cleanup(h)
+		} else {
+			bufferA.Release(h)
+			bufferB.Release(h)
+		}
+
+		if i%5000 == 0 {
+			// iter test is slow, run it less frequently
+			key := make([]byte, rand.Intn(19)+1)
+			rand2.Read(key)
+
+			require.Equal(bufferA.Dirty(), bufferB.Dirty())
+			require.Equal(bufferA.Len(), bufferB.Len())
+			require.Equal(bufferA.Size(), bufferB.Size(), i)
+			v1, err1 := bufferA.Get(context.Background(), key)
+			v2, err2 := bufferB.Get(context.Background(), key)
+			require.Equal(err1, err2)
+			require.Equal(v1, v2)
+
+			iter1, err := bufferA.Iter(key, nil)
+			require.Nil(err)
+			iter2, err := bufferB.Iter(key, nil)
+			require.Nil(err)
+			checkIters(iter1, iter2, key)
+
+			iter1, err = bufferA.IterReverse(nil, key)
+			require.Nil(err)
+			iter2, err = bufferB.IterReverse(nil, key)
+			require.Nil(err)
+			checkIters(iter1, iter2, key)
+		}
+	}
 }

@@ -44,8 +44,8 @@ import (
 
 func TestUnionStoreGetSet(t *testing.T) {
 	assert := assert.New(t)
-	store := newMemDB()
-	us := NewUnionStore(&mockSnapshot{store})
+	store := NewMemDB()
+	us := NewUnionStore(NewMemDBWithContext(), &mockSnapshot{store})
 
 	err := store.Set([]byte("1"), []byte("1"))
 	assert.Nil(err)
@@ -63,8 +63,8 @@ func TestUnionStoreGetSet(t *testing.T) {
 
 func TestUnionStoreDelete(t *testing.T) {
 	assert := assert.New(t)
-	store := newMemDB()
-	us := NewUnionStore(&mockSnapshot{store})
+	store := NewMemDB()
+	us := NewUnionStore(NewMemDBWithContext(), &mockSnapshot{store})
 
 	err := store.Set([]byte("1"), []byte("1"))
 	assert.Nil(err)
@@ -82,8 +82,8 @@ func TestUnionStoreDelete(t *testing.T) {
 
 func TestUnionStoreSeek(t *testing.T) {
 	assert := assert.New(t)
-	store := newMemDB()
-	us := NewUnionStore(&mockSnapshot{store})
+	store := NewMemDB()
+	us := NewUnionStore(NewMemDBWithContext(), &mockSnapshot{store})
 
 	err := store.Set([]byte("1"), []byte("1"))
 	assert.Nil(err)
@@ -115,8 +115,8 @@ func TestUnionStoreSeek(t *testing.T) {
 
 func TestUnionStoreIterReverse(t *testing.T) {
 	assert := assert.New(t)
-	store := newMemDB()
-	us := NewUnionStore(&mockSnapshot{store})
+	store := NewMemDB()
+	us := NewUnionStore(NewMemDBWithContext(), &mockSnapshot{store})
 
 	err := store.Set([]byte("1"), []byte("1"))
 	assert.Nil(err)
@@ -125,25 +125,33 @@ func TestUnionStoreIterReverse(t *testing.T) {
 	err = store.Set([]byte("3"), []byte("3"))
 	assert.Nil(err)
 
-	iter, err := us.IterReverse(nil)
+	iter, err := us.IterReverse(nil, nil)
 	assert.Nil(err)
 	checkIterator(t, iter, [][]byte{[]byte("3"), []byte("2"), []byte("1")}, [][]byte{[]byte("3"), []byte("2"), []byte("1")})
 
-	iter, err = us.IterReverse([]byte("3"))
+	iter, err = us.IterReverse([]byte("3"), []byte("1"))
+	assert.Nil(err)
+	checkIterator(t, iter, [][]byte{[]byte("2"), []byte("1")}, [][]byte{[]byte("2"), []byte("1")})
+
+	iter, err = us.IterReverse([]byte("3"), nil)
 	assert.Nil(err)
 	checkIterator(t, iter, [][]byte{[]byte("2"), []byte("1")}, [][]byte{[]byte("2"), []byte("1")})
 
 	err = us.GetMemBuffer().Set([]byte("0"), []byte("0"))
 	assert.Nil(err)
-	iter, err = us.IterReverse([]byte("3"))
+	iter, err = us.IterReverse([]byte("3"), nil)
 	assert.Nil(err)
 	checkIterator(t, iter, [][]byte{[]byte("2"), []byte("1"), []byte("0")}, [][]byte{[]byte("2"), []byte("1"), []byte("0")})
 
 	err = us.GetMemBuffer().Delete([]byte("1"))
 	assert.Nil(err)
-	iter, err = us.IterReverse([]byte("3"))
+	iter, err = us.IterReverse([]byte("3"), nil)
 	assert.Nil(err)
 	checkIterator(t, iter, [][]byte{[]byte("2"), []byte("0")}, [][]byte{[]byte("2"), []byte("0")})
+
+	iter, err = us.IterReverse([]byte("3"), []byte("1"))
+	assert.Nil(err)
+	checkIterator(t, iter, [][]byte{[]byte("2")}, [][]byte{[]byte("2")})
 }
 
 func checkIterator(t *testing.T, iter Iterator, keys [][]byte, values [][]byte) {

@@ -52,12 +52,12 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tikv/client-go/v2/config"
+	"github.com/tikv/client-go/v2/config/retry"
 	tikverr "github.com/tikv/client-go/v2/error"
 	"github.com/tikv/client-go/v2/internal/client"
 	"github.com/tikv/client-go/v2/internal/latch"
 	"github.com/tikv/client-go/v2/internal/locate"
 	"github.com/tikv/client-go/v2/internal/logutil"
-	"github.com/tikv/client-go/v2/internal/retry"
 	"github.com/tikv/client-go/v2/internal/unionstore"
 	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/metrics"
@@ -80,7 +80,8 @@ type twoPhaseCommitAction interface {
 
 // Global variable set by config file.
 var (
-	ManagedLockTTL uint64 = 20000 // 20s
+	ManagedLockTTL     uint64 = 20000               // 20s
+	MaxPipelinedTxnTTL uint64 = 24 * 60 * 60 * 1000 // 24h
 )
 
 var (
@@ -163,7 +164,7 @@ type twoPhaseCommitter struct {
 	}
 
 	useAsyncCommit    uint32
-	minCommitTS       uint64
+	minCommitTSMgr    *minCommitTsManager
 	maxCommitTS       uint64
 	prewriteStarted   bool
 	prewriteCancelled uint32
@@ -195,6 +196,11 @@ type twoPhaseCommitter struct {
 	isInternal bool
 
 	forUpdateTSConstraints map[string]uint64
+
+	pipelinedCommitInfo struct {
+		primaryOp                    kvrpcpb.Op
+		pipelinedStart, pipelinedEnd []byte
+	}
 }
 
 type memBufferMutations struct {
@@ -461,7 +467,7 @@ func (c *PlainMutations) AppendMutation(mutation PlainMutation) {
 
 // newTwoPhaseCommitter creates a twoPhaseCommitter.
 func newTwoPhaseCommitter(txn *KVTxn, sessionID uint64) (*twoPhaseCommitter, error) {
-	return &twoPhaseCommitter{
+	committer := &twoPhaseCommitter{
 		store:             txn.store,
 		txn:               txn,
 		startTS:           txn.StartTS(),
@@ -471,7 +477,9 @@ func newTwoPhaseCommitter(txn *KVTxn, sessionID uint64) (*twoPhaseCommitter, err
 		binlog:            txn.binlog,
 		diskFullOpt:       kvrpcpb.DiskFullOpt_NotAllowedOnFull,
 		resourceGroupName: txn.resourceGroupName,
-	}, nil
+		minCommitTSMgr:    newMinCommitTsManager(),
+	}
+	return committer, nil
 }
 
 func (c *twoPhaseCommitter) extractKeyExistsErr(err *tikverr.ErrKeyExist) error {
@@ -543,7 +551,7 @@ func (c *twoPhaseCommitter) initKeysAndMutations(ctx context.Context) error {
 	var size, putCnt, delCnt, lockCnt, checkCnt int
 
 	txn := c.txn
-	memBuf := txn.GetMemBuffer()
+	memBuf := txn.GetMemBuffer().GetMemDB()
 	sizeHint := txn.us.GetMemBuffer().Len()
 	c.mutations = newMemBufferMutations(sizeHint, memBuf)
 	c.isPessimistic = txn.IsPessimistic()
@@ -860,7 +868,8 @@ func (c *twoPhaseCommitter) groupMutations(bo *retry.Backoffer, mutations Commit
 		if uint32(group.mutations.Len()) >= preSplitDetectThresholdVal {
 			logutil.BgLogger().Info("2PC detect large amount of mutations on a single region",
 				zap.Uint64("region", group.region.GetID()),
-				zap.Int("mutations count", group.mutations.Len()))
+				zap.Int("mutations count", group.mutations.Len()),
+				zap.Uint64("startTS", c.startTS))
 			if c.preSplitRegion(bo.GetCtx(), group) {
 				didPreSplit = true
 			}
@@ -899,14 +908,15 @@ func (c *twoPhaseCommitter) preSplitRegion(ctx context.Context, group groupedMut
 	regionIDs, err := c.store.SplitRegions(ctx, splitKeys, true, nil)
 	if err != nil {
 		logutil.BgLogger().Warn("2PC split regions failed", zap.Uint64("regionID", group.region.GetID()),
-			zap.Int("keys count", keysLength), zap.Error(err))
+			zap.Int("keys count", keysLength), zap.Error(err), zap.Uint64("startTS", c.startTS))
 		return false
 	}
 
 	for _, regionID := range regionIDs {
 		err := c.store.WaitScatterRegionFinish(ctx, regionID, 0)
 		if err != nil {
-			logutil.BgLogger().Warn("2PC wait scatter region failed", zap.Uint64("regionID", regionID), zap.Error(err))
+			logutil.BgLogger().Warn("2PC wait scatter region failed", zap.Uint64("regionID", regionID), zap.Error(err),
+				zap.Uint64("startTS", c.startTS))
 		}
 	}
 	// Invalidate the old region cache information.
@@ -920,7 +930,9 @@ const CommitSecondaryMaxBackoff = 41000
 // doActionOnGroupedMutations splits groups into batches (there is one group per region, and potentially many batches per group, but all mutations
 // in a batch will belong to the same region).
 func (c *twoPhaseCommitter) doActionOnGroupMutations(bo *retry.Backoffer, action twoPhaseCommitAction, groups []groupedMutations) error {
-	action.tiKVTxnRegionsNumHistogram().Observe(float64(len(groups)))
+	if histogram := action.tiKVTxnRegionsNumHistogram(); histogram != nil {
+		histogram.Observe(float64(len(groups)))
+	}
 
 	var sizeFunc = c.keySize
 
@@ -1007,9 +1019,7 @@ func (c *twoPhaseCommitter) doActionOnGroupMutations(bo *retry.Backoffer, action
 				zap.Uint64("sessionID", c.sessionID))
 			return nil
 		}
-		c.store.WaitGroup().Add(1)
-		err = c.store.Go(func() {
-			defer c.store.WaitGroup().Done()
+		err = c.txn.spawnWithStorePool(func() {
 			if c.sessionID > 0 {
 				if v, err := util.EvalFailpoint("beforeCommitSecondaries"); err == nil {
 					if s, ok := v.(string); !ok {
@@ -1034,7 +1044,6 @@ func (c *twoPhaseCommitter) doActionOnGroupMutations(bo *retry.Backoffer, action
 			}
 		})
 		if err != nil {
-			c.store.WaitGroup().Done()
 			logutil.BgLogger().Error("fail to create goroutine",
 				zap.Uint64("session", c.sessionID),
 				zap.Stringer("action type", action),
@@ -1048,7 +1057,27 @@ func (c *twoPhaseCommitter) doActionOnGroupMutations(bo *retry.Backoffer, action
 }
 
 // doActionOnBatches does action to batches in parallel.
-func (c *twoPhaseCommitter) doActionOnBatches(bo *retry.Backoffer, action twoPhaseCommitAction, batches []batchMutations) error {
+func (c *twoPhaseCommitter) doActionOnBatches(
+	bo *retry.Backoffer, action twoPhaseCommitAction,
+	batches []batchMutations,
+) error {
+	// killSignal should never be nil for TiDB
+	if c.txn != nil && c.txn.vars != nil && c.txn.vars.Killed != nil {
+		// Do not reset the killed flag here. Let the upper layer reset the flag.
+		// Before it resets, any request is considered valid to be killed.
+		status := atomic.LoadUint32(c.txn.vars.Killed)
+		if status != 0 {
+			logutil.BgLogger().Info(
+				"query is killed", zap.Uint32(
+					"signal",
+					status,
+				),
+			)
+			// TODO: There might be various signals besides a query interruption,
+			// but we are unable to differentiate them, because the definition is in TiDB.
+			return errors.WithStack(tikverr.ErrQueryInterruptedWithSignal{Signal: status})
+		}
+	}
 	if len(batches) == 0 {
 		return nil
 	}
@@ -1073,16 +1102,28 @@ func (c *twoPhaseCommitter) doActionOnBatches(bo *retry.Backoffer, action twoPha
 		}
 		return nil
 	}
-	rateLim := len(batches)
+	rateLim := c.calcActionConcurrency(len(batches), action)
+	batchExecutor := newBatchExecutor(rateLim, c, action, bo)
+	return batchExecutor.process(batches)
+}
+
+func (c *twoPhaseCommitter) calcActionConcurrency(
+	numBatches int, action twoPhaseCommitAction,
+) int {
+	rateLim := numBatches
 	// Set rateLim here for the large transaction.
 	// If the rate limit is too high, tikv will report service is busy.
 	// If the rate limit is too low, we can't full utilize the tikv's throughput.
 	// TODO: Find a self-adaptive way to control the rate limit here.
-	if rateLim > config.GetGlobalConfig().CommitterConcurrency {
-		rateLim = config.GetGlobalConfig().CommitterConcurrency
+	switch action.(type) {
+	case actionPipelinedFlush:
+		rateLim = min(rateLim, max(1, c.txn.pipelinedFlushConcurrency))
+	default:
+		if rateLim > config.GetGlobalConfig().CommitterConcurrency {
+			rateLim = config.GetGlobalConfig().CommitterConcurrency
+		}
 	}
-	batchExecutor := newBatchExecutor(rateLim, c, action, bo)
-	return batchExecutor.process(batches)
+	return rateLim
 }
 
 func (c *twoPhaseCommitter) keyValueSize(key, value []byte) int {
@@ -1109,13 +1150,76 @@ const (
 	stateClosed
 )
 
+// WriteAccessLevel represents the level of write access required to modify the value
+type WriteAccessLevel int
+
+const (
+	ttlAccess   WriteAccessLevel = 1
+	twoPCAccess WriteAccessLevel = 2
+)
+
+// minCommitTsManager manages a minimum commit timestamp with different write access levels.
+type minCommitTsManager struct {
+	mutex               sync.Mutex
+	value               uint64
+	requiredWriteAccess WriteAccessLevel
+}
+
+// newMinCommitTsManager creates and returns a new minCommitTsManager.
+func newMinCommitTsManager() *minCommitTsManager {
+	return &minCommitTsManager{requiredWriteAccess: ttlAccess}
+}
+
+// tryUpdate update the value if the provided write access level is sufficient and
+// the new value is greater.
+func (m *minCommitTsManager) tryUpdate(newValue uint64, writeAccess WriteAccessLevel) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if writeAccess < m.requiredWriteAccess {
+		return
+	}
+
+	if newValue > m.value {
+		m.value = newValue
+	}
+}
+
+// elevateWriteAccess elevates the required write access level.
+// It returns the current value.
+func (m *minCommitTsManager) elevateWriteAccess(newLevel WriteAccessLevel) uint64 {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	if newLevel > m.requiredWriteAccess {
+		m.requiredWriteAccess = newLevel
+	}
+	return m.value
+}
+
+// get returns the current value. This is a read operation and doesn't require write access.
+func (m *minCommitTsManager) get() uint64 {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	return m.value
+}
+
+// getRequiredWriteAccess returns the current required write access level.
+func (m *minCommitTsManager) getRequiredWriteAccess() WriteAccessLevel {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	return m.requiredWriteAccess
+}
+
 type ttlManager struct {
 	state   ttlManagerState
 	ch      chan struct{}
 	lockCtx *kv.LockCtx
 }
 
-func (tm *ttlManager) run(c *twoPhaseCommitter, lockCtx *kv.LockCtx) {
+func (tm *ttlManager) run(c *twoPhaseCommitter, lockCtx *kv.LockCtx, isPipelinedTxn bool) {
 	if _, err := util.EvalFailpoint("doNotKeepAlive"); err == nil {
 		return
 	}
@@ -1127,7 +1231,7 @@ func (tm *ttlManager) run(c *twoPhaseCommitter, lockCtx *kv.LockCtx) {
 	tm.ch = make(chan struct{})
 	tm.lockCtx = lockCtx
 
-	go keepAlive(c, tm.ch, c.primary(), lockCtx)
+	go keepAlive(c, tm.ch, tm, c.primary(), lockCtx, isPipelinedTxn)
 }
 
 func (tm *ttlManager) close() {
@@ -1147,8 +1251,15 @@ func (tm *ttlManager) reset() {
 const keepAliveMaxBackoff = 20000
 const pessimisticLockMaxBackoff = 20000
 const maxConsecutiveFailure = 10
+const broadcastGracePeriod = 5 * time.Second
+const broadcastMaxBackoff = 10000
 
-func keepAlive(c *twoPhaseCommitter, closeCh chan struct{}, primaryKey []byte, lockCtx *kv.LockCtx) {
+// keepAlive keeps sending heartbeat to update the primary key's TTL
+// For pipelined transactions, it also updates min_commit_ts, and broadcasts it to all TiKVs.
+func keepAlive(
+	c *twoPhaseCommitter, closeCh chan struct{}, tm *ttlManager, primaryKey []byte,
+	lockCtx *kv.LockCtx, isPipelinedTxn bool,
+) {
 	// Ticker is set to 1/2 of the ManagedLockTTL.
 	ticker := time.NewTicker(time.Duration(atomic.LoadUint64(&ManagedLockTTL)) * time.Millisecond / 2)
 	defer ticker.Stop()
@@ -1159,6 +1270,7 @@ func keepAlive(c *twoPhaseCommitter, closeCh chan struct{}, primaryKey []byte, l
 	keepFail := 0
 	for {
 		select {
+		// because ttlManager can be reset, closeCh may not be equal to tm.ch.
 		case <-closeCh:
 			return
 		case <-ticker.C:
@@ -1175,53 +1287,194 @@ func keepAlive(c *twoPhaseCommitter, closeCh chan struct{}, primaryKey []byte, l
 			}
 
 			uptime := uint64(oracle.ExtractPhysical(now) - oracle.ExtractPhysical(c.startTS))
-			if uptime > config.GetGlobalConfig().MaxTxnTTL {
+			maxTtl := config.GetGlobalConfig().MaxTxnTTL
+			if isPipelinedTxn {
+				maxTtl = max(maxTtl, MaxPipelinedTxnTTL)
+			}
+			if uptime > maxTtl {
 				// Checks maximum lifetime for the ttlManager, so when something goes wrong
 				// the key will not be locked forever.
 				logutil.Logger(bo.GetCtx()).Info("ttlManager live up to its lifetime",
 					zap.Uint64("txnStartTS", c.startTS),
 					zap.Uint64("uptime", uptime),
-					zap.Uint64("maxTxnTTL", config.GetGlobalConfig().MaxTxnTTL))
+					zap.Uint64("maxTxnTTL", config.GetGlobalConfig().MaxTxnTTL),
+					zap.Bool("isPipelinedTxn", isPipelinedTxn),
+				)
 				metrics.TiKVTTLLifeTimeReachCounter.Inc()
 				// the pessimistic locks may expire if the ttl manager has timed out, set `LockExpired` flag
 				// so that this transaction could only commit or rollback with no more statement executions
 				if c.isPessimistic && lockCtx != nil && lockCtx.LockExpired != nil {
 					atomic.StoreUint32(lockCtx.LockExpired, 1)
 				}
+				if isPipelinedTxn {
+					// the pipelined txn can last a long time after max ttl exceeded.
+					// if we don't stop it, it may fail when committing the primary key with high probability.
+					tm.close()
+				}
 				return
+			}
+
+			// update minCommitTS, if it's a non-async-commit pipelined transaction
+			if isPipelinedTxn &&
+				!c.isOnePC() &&
+				!c.isAsyncCommit() &&
+				c.minCommitTSMgr.getRequiredWriteAccess() <= ttlAccess {
+				c.minCommitTSMgr.tryUpdate(now, ttlAccess)
 			}
 
 			newTTL := uptime + atomic.LoadUint64(&ManagedLockTTL)
 			logutil.Logger(bo.GetCtx()).Info("send TxnHeartBeat",
-				zap.Uint64("startTS", c.startTS), zap.Uint64("newTTL", newTTL))
+				zap.Uint64("startTS", c.startTS),
+				zap.Uint64("newTTL", newTTL),
+				zap.Bool("isPipelinedTxn", isPipelinedTxn),
+			)
 			startTime := time.Now()
-			_, stopHeartBeat, err := sendTxnHeartBeat(bo, c.store, primaryKey, c.startTS, newTTL)
+			_, stopHeartBeat, err := sendTxnHeartBeat(
+				bo, c.store, primaryKey, c.startTS, newTTL, c.minCommitTSMgr.get(),
+			)
 			if err != nil {
 				keepFail++
 				metrics.TxnHeartBeatHistogramError.Observe(time.Since(startTime).Seconds())
 				logutil.Logger(bo.GetCtx()).Debug("send TxnHeartBeat failed",
 					zap.Error(err),
-					zap.Uint64("txnStartTS", c.startTS))
+					zap.Uint64("txnStartTS", c.startTS),
+					zap.Bool("isPipelinedTxn", isPipelinedTxn),
+				)
 				if stopHeartBeat || keepFail > maxConsecutiveFailure {
 					logutil.Logger(bo.GetCtx()).Warn("stop TxnHeartBeat",
 						zap.Error(err),
 						zap.Int("consecutiveFailure", keepFail),
-						zap.Uint64("txnStartTS", c.startTS))
+						zap.Uint64("txnStartTS", c.startTS),
+						zap.Bool("isPipelinedTxn", isPipelinedTxn),
+					)
+					if isPipelinedTxn {
+						// pipelined DML cannot run without the ttlManager.
+						// Once the ttl manager fails, the transaction should be rolled back to avoid writing useless locks.
+						// close the ttlManager and the further flush will stop.
+						tm.close()
+					}
 					return
 				}
 				continue
 			}
+
 			keepFail = 0
 			metrics.TxnHeartBeatHistogramOK.Observe(time.Since(startTime).Seconds())
+			// Broadcast to all stores only when the heartbeat succeeds.
+			// This ensures that PK is the single source of truth for transaction status on the
+			// TiKV side. It prevents potential inconsistencies where the cached information might
+			// be more up-to-date than the info stored in the PK.
+			if isPipelinedTxn {
+				broadcastToAllStores(
+					c.txn,
+					c.store,
+					retry.NewBackofferWithVars(
+						context.Background(),
+						broadcastMaxBackoff,
+						c.txn.vars,
+					),
+					&kvrpcpb.TxnStatus{
+						StartTs:     c.startTS,
+						MinCommitTs: c.minCommitTSMgr.get(),
+						CommitTs:    0,
+						RolledBack:  false,
+						IsCompleted: false,
+					},
+					c.resourceGroupName,
+					c.resourceGroupTag,
+				)
+			}
 		}
 	}
 }
 
-func sendTxnHeartBeat(bo *retry.Backoffer, store kvstore, primary []byte, startTS, ttl uint64) (newTTL uint64, stopHeartBeat bool, err error) {
+const broadcastRpcTimeout = time.Second * 5
+const broadcastMaxConcurrency = 10
+
+// broadcastToAllStores asynchronously broadcasts the transaction status to all stores.
+// Errors are ignored.
+func broadcastToAllStores(
+	txn *KVTxn,
+	store kvstore,
+	bo *retry.Backoffer,
+	status *kvrpcpb.TxnStatus,
+	resourceGroupName string,
+	resourceGroupTag []byte,
+) {
+	broadcastFunc := func() {
+		stores := store.GetRegionCache().GetStoresByType(tikvrpc.TiKV)
+		concurrency := min(broadcastMaxConcurrency, len(stores))
+		rateLimit := make(chan struct{}, concurrency)
+
+		var wg sync.WaitGroup
+
+		for _, s := range stores {
+			rateLimit <- struct{}{}
+			wg.Add(1)
+			target := s
+
+			err := txn.spawnWithStorePool(func() {
+				defer wg.Done()
+				defer func() { <-rateLimit }()
+
+				req := tikvrpc.NewRequest(
+					tikvrpc.CmdBroadcastTxnStatus, &kvrpcpb.BroadcastTxnStatusRequest{
+						TxnStatus: []*kvrpcpb.TxnStatus{status},
+					},
+				)
+				req.Context.ClusterId = store.GetClusterID()
+				req.Context.ResourceControlContext = &kvrpcpb.ResourceControlContext{
+					ResourceGroupName: resourceGroupName,
+				}
+				req.Context.ResourceGroupTag = resourceGroupTag
+				req.Context.RequestSource = txn.GetRequestSource()
+
+				_, err := store.GetTiKVClient().SendRequest(
+					bo.GetCtx(),
+					target.GetAddr(),
+					req,
+					broadcastRpcTimeout,
+				)
+				if err != nil {
+					logutil.Logger(store.Ctx()).Info(
+						"broadcast txn status failed",
+						zap.Uint64("storeID", target.StoreID()),
+						zap.String("storeAddr", target.GetAddr()),
+						zap.Stringer("status", status),
+						zap.Error(err),
+					)
+				}
+			})
+
+			if err != nil {
+				// If spawning the goroutine fails, release the slot and mark done
+				<-rateLimit
+				wg.Done()
+				logutil.Logger(store.Ctx()).Error("failed to spawn worker goroutine", zap.Error(err))
+			}
+		}
+
+		wg.Wait()
+	}
+
+	if err := txn.spawnWithStorePool(broadcastFunc); err != nil {
+		logutil.Logger(store.Ctx()).Error("failed to spawn goroutine for broadcasting txn status",
+			zap.Error(err))
+	}
+}
+
+func sendTxnHeartBeat(
+	bo *retry.Backoffer,
+	store kvstore,
+	primary []byte,
+	startTS, ttl uint64,
+	minCommitTS uint64,
+) (newTTL uint64, stopHeartBeat bool, err error) {
 	req := tikvrpc.NewRequest(tikvrpc.CmdTxnHeartBeat, &kvrpcpb.TxnHeartBeatRequest{
 		PrimaryLock:   primary,
 		StartVersion:  startTS,
 		AdviseLockTtl: ttl,
+		MinCommitTs:   minCommitTS,
 	})
 	for {
 		loc, err := store.GetRegionCache().LocateKey(bo, primary)
@@ -1355,19 +1608,45 @@ func (c *twoPhaseCommitter) cleanup(ctx context.Context) {
 		return
 	}
 	c.cleanWg.Add(1)
-	c.store.WaitGroup().Add(1)
-	go func() {
-		defer c.store.WaitGroup().Done()
+	c.txn.spawn(func() {
+		defer c.cleanWg.Done()
+
 		if _, err := util.EvalFailpoint("commitFailedSkipCleanup"); err == nil {
 			logutil.Logger(ctx).Info("[failpoint] injected skip cleanup secondaries on failure",
 				zap.Uint64("txnStartTS", c.startTS))
-			c.cleanWg.Done()
 			return
 		}
 
 		cleanupKeysCtx := context.WithValue(c.store.Ctx(), retry.TxnStartKey, ctx.Value(retry.TxnStartKey))
 		var err error
-		if !c.isOnePC() {
+		if c.txn.IsPipelined() {
+			if len(c.pipelinedCommitInfo.pipelinedStart) != 0 && len(c.pipelinedCommitInfo.pipelinedEnd) != 0 {
+				broadcastToAllStores(
+					c.txn,
+					c.store,
+					retry.NewBackofferWithVars(
+						ctx,
+						broadcastMaxBackoff,
+						c.txn.vars,
+					),
+					&kvrpcpb.TxnStatus{
+						StartTs:     c.startTS,
+						MinCommitTs: c.txn.committer.minCommitTSMgr.get(),
+						CommitTs:    0,
+						RolledBack:  true,
+						IsCompleted: false,
+					},
+					c.resourceGroupName,
+					c.resourceGroupTag,
+				)
+				c.resolveFlushedLocks(
+					retry.NewBackofferWithVars(cleanupKeysCtx, cleanupMaxBackoff, c.txn.vars),
+					c.pipelinedCommitInfo.pipelinedStart,
+					c.pipelinedCommitInfo.pipelinedEnd,
+					false,
+				)
+			}
+		} else if !c.isOnePC() {
 			err = c.cleanupMutations(retry.NewBackofferWithVars(cleanupKeysCtx, cleanupMaxBackoff, c.txn.vars), c.mutations)
 		} else if c.isPessimistic {
 			err = c.pessimisticRollbackMutations(retry.NewBackofferWithVars(cleanupKeysCtx, cleanupMaxBackoff, c.txn.vars), c.mutations)
@@ -1382,12 +1661,12 @@ func (c *twoPhaseCommitter) cleanup(ctx context.Context) {
 				zap.Uint64("txnStartTS", c.startTS), zap.Bool("isPessimistic", c.isPessimistic),
 				zap.Bool("isOnePC", c.isOnePC()))
 		}
-		c.cleanWg.Done()
-	}()
+	})
 }
 
 // execute executes the two-phase commit protocol.
 func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
+	c.minCommitTSMgr.elevateWriteAccess(twoPCAccess)
 	var binlogSkipped bool
 	defer func() {
 		if c.isOnePC() {
@@ -1440,23 +1719,25 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 
 	commitDetail := c.getDetail()
 	commitTSMayBeCalculated := false
-	// Check async commit is available or not.
-	if c.checkAsyncCommit() {
-		commitTSMayBeCalculated = true
-		c.setAsyncCommit(true)
-		c.hasTriedAsyncCommit = true
-	}
-	// Check if 1PC is enabled.
-	if c.checkOnePC() {
-		commitTSMayBeCalculated = true
-		c.setOnePC(true)
-		c.hasTriedOnePC = true
+	if !c.txn.isPipelined {
+		// Check async commit is available or not.
+		if c.checkAsyncCommit() {
+			commitTSMayBeCalculated = true
+			c.setAsyncCommit(true)
+			c.hasTriedAsyncCommit = true
+		}
+		// Check if 1PC is enabled.
+		if c.checkOnePC() {
+			commitTSMayBeCalculated = true
+			c.setOnePC(true)
+			c.hasTriedOnePC = true
+		}
 	}
 
 	// if lazy uniqueness check is enabled in TiDB (@@constraint_check_in_place_pessimistic=0), for_update_ts might be
 	// zero for a pessimistic transaction. We set it to the start_ts to force the PrewritePessimistic path in TiKV.
 	// TODO: can we simply set for_update_ts = start_ts for all pessimistic transactions whose for_update_ts=0?
-	if c.forUpdateTS == 0 {
+	if c.forUpdateTS == 0 && !c.txn.isPipelined {
 		for i := 0; i < c.mutations.Len(); i++ {
 			if c.mutations.NeedConstraintCheckInPrewrite(i) {
 				c.forUpdateTS = c.startTS
@@ -1489,7 +1770,7 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 		}
 		commitDetail.GetLatestTsTime = time.Since(start)
 		// Plus 1 to avoid producing the same commit TS with previously committed transactions
-		c.minCommitTS = latestTS + 1
+		c.minCommitTSMgr.tryUpdate(latestTS+1, twoPCAccess)
 	}
 	// Calculate maxCommitTS if necessary
 	if commitTSMayBeCalculated {
@@ -1506,6 +1787,21 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 	var binlogChan <-chan BinlogWriteResult
 	if c.shouldWriteBinlog() {
 		binlogChan = c.binlog.Prewrite(ctx, c.primary())
+	}
+
+	if c.txn.IsPipelined() {
+		if _, err = c.txn.GetMemBuffer().Flush(true); err != nil {
+			return err
+		}
+		if err = c.txn.GetMemBuffer().FlushWait(); err != nil {
+			return err
+		}
+		c.txn.pipelinedCancel()
+		if len(c.pipelinedCommitInfo.pipelinedStart) == 0 || len(c.pipelinedCommitInfo.pipelinedEnd) == 0 {
+			return errors.Errorf("unexpected empty pipelinedStart(%s) or pipelinedEnd(%s)",
+				c.pipelinedCommitInfo.pipelinedStart, c.pipelinedCommitInfo.pipelinedEnd)
+		}
+		return c.commitFlushedMutations(bo)
 	}
 
 	start := time.Now()
@@ -1593,10 +1889,10 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 	}
 
 	if c.isAsyncCommit() {
-		if c.minCommitTS == 0 {
+		if c.minCommitTSMgr.get() == 0 {
 			return errors.Errorf("session %d invalid minCommitTS for async commit protocol after prewrite, startTS=%v", c.sessionID, c.startTS)
 		}
-		commitTS = c.minCommitTS
+		commitTS = c.minCommitTSMgr.get()
 	} else {
 		start = time.Now()
 		logutil.Event(ctx, "start get commit ts")
@@ -1680,9 +1976,7 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 				zap.Uint64("sessionID", c.sessionID))
 			return nil
 		}
-		c.store.WaitGroup().Add(1)
-		go func() {
-			defer c.store.WaitGroup().Done()
+		c.txn.spawn(func() {
 			if _, err := util.EvalFailpoint("asyncCommitDoNothing"); err == nil {
 				return
 			}
@@ -1692,14 +1986,14 @@ func (c *twoPhaseCommitter) execute(ctx context.Context) (err error) {
 				logutil.Logger(ctx).Warn("2PC async commit failed", zap.Uint64("sessionID", c.sessionID),
 					zap.Uint64("startTS", c.startTS), zap.Uint64("commitTS", c.commitTS), zap.Error(err))
 			}
-		}()
+		})
 		return nil
 	}
 	return c.commitTxn(ctx, commitDetail)
 }
 
 func (c *twoPhaseCommitter) commitTxn(ctx context.Context, commitDetail *util.CommitDetails) error {
-	c.txn.GetMemBuffer().DiscardValues()
+	c.txn.GetMemBuffer().GetMemDB().DiscardValues()
 	start := time.Now()
 
 	// Use the VeryLongMaxBackoff to commit the primary key.
@@ -1780,7 +2074,9 @@ func (c *twoPhaseCommitter) checkSchemaValid(ctx context.Context, checkTS uint64
 	}
 	if c.txn.schemaLeaseChecker == nil {
 		if c.sessionID > 0 {
-			logutil.Logger(ctx).Warn("schemaLeaseChecker is not set for this transaction",
+			// Schema check is not mandatory since MDL is introduced.
+			logutil.Logger(ctx).Debug(
+				"schemaLeaseChecker is not set for this transaction",
 				zap.Uint64("sessionID", c.sessionID),
 				zap.Uint64("startTS", c.startTS),
 				zap.Uint64("checkTS", checkTS))
@@ -1990,16 +2286,18 @@ func (batchExe *batchExecutor) process(batches []batchMutations) error {
 		return err
 	}
 
-	// For prewrite, stop sending other requests after receiving first error.
+	// For prewrite and flush, stop sending other requests after receiving first error.
 	// However, AssertionFailed error is less prior to other kinds of errors. If we meet an AssertionFailed error,
 	// we hold it to see if there's other error, and return it if there are no other kinds of errors.
 	// This is because when there are transaction conflicts in pessimistic transaction, it's possible that the
 	// non-pessimistic-locked keys may report false-positive assertion failure.
 	// See also: https://github.com/tikv/tikv/issues/12113
 	var cancel context.CancelFunc
-	if _, ok := batchExe.action.(actionPrewrite); ok {
+	switch batchExe.action.(type) {
+	case actionPrewrite, actionPipelinedFlush:
 		batchExe.backoffer, cancel = batchExe.backoffer.Fork()
 		defer cancel()
+	default:
 	}
 	var assertionFailedErr error = nil
 	// concurrently do the work for each batch.

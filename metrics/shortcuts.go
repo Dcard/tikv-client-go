@@ -119,14 +119,17 @@ var (
 	RegionCacheCounterWithGetCacheMissError           prometheus.Counter
 	RegionCacheCounterWithScanRegionsOK               prometheus.Counter
 	RegionCacheCounterWithScanRegionsError            prometheus.Counter
+	RegionCacheCounterWithBatchScanRegionsOK          prometheus.Counter
+	RegionCacheCounterWithBatchScanRegionsError       prometheus.Counter
 	RegionCacheCounterWithGetStoreOK                  prometheus.Counter
 	RegionCacheCounterWithGetStoreError               prometheus.Counter
 	RegionCacheCounterWithInvalidateStoreRegionsOK    prometheus.Counter
 
-	LoadRegionCacheHistogramWhenCacheMiss  prometheus.Observer
-	LoadRegionCacheHistogramWithRegions    prometheus.Observer
-	LoadRegionCacheHistogramWithRegionByID prometheus.Observer
-	LoadRegionCacheHistogramWithGetStore   prometheus.Observer
+	LoadRegionCacheHistogramWhenCacheMiss        prometheus.Observer
+	LoadRegionCacheHistogramWithRegions          prometheus.Observer
+	LoadRegionCacheHistogramWithBatchScanRegions prometheus.Observer
+	LoadRegionCacheHistogramWithRegionByID       prometheus.Observer
+	LoadRegionCacheHistogramWithGetStore         prometheus.Observer
 
 	TxnHeartBeatHistogramOK    prometheus.Observer
 	TxnHeartBeatHistogramError prometheus.Observer
@@ -160,10 +163,20 @@ var (
 	AggressiveLockedKeysLockedWithConflict prometheus.Counter
 	AggressiveLockedKeysNonForceLock       prometheus.Counter
 
-	StaleReadHitInTraffic   prometheus.Observer
-	StaleReadHitOutTraffic  prometheus.Observer
-	StaleReadMissInTraffic  prometheus.Observer
-	StaleReadMissOutTraffic prometheus.Observer
+	StaleReadHitCounter  prometheus.Counter
+	StaleReadMissCounter prometheus.Counter
+
+	StaleReadReqLocalCounter     prometheus.Counter
+	StaleReadReqCrossZoneCounter prometheus.Counter
+
+	StaleReadLocalInBytes   prometheus.Counter
+	StaleReadLocalOutBytes  prometheus.Counter
+	StaleReadRemoteInBytes  prometheus.Counter
+	StaleReadRemoteOutBytes prometheus.Counter
+
+	BatchRequestDurationSend prometheus.Observer
+	BatchRequestDurationRecv prometheus.Observer
+	BatchRequestDurationDone prometheus.Observer
 )
 
 func initShortcuts() {
@@ -247,6 +260,8 @@ func initShortcuts() {
 	RegionCacheCounterWithGetCacheMissError = TiKVRegionCacheCounter.WithLabelValues("get_region_when_miss", "err")
 	RegionCacheCounterWithScanRegionsOK = TiKVRegionCacheCounter.WithLabelValues("scan_regions", "ok")
 	RegionCacheCounterWithScanRegionsError = TiKVRegionCacheCounter.WithLabelValues("scan_regions", "err")
+	RegionCacheCounterWithBatchScanRegionsOK = TiKVRegionCacheCounter.WithLabelValues("batch_scan_regions", "ok")
+	RegionCacheCounterWithBatchScanRegionsError = TiKVRegionCacheCounter.WithLabelValues("batch_scan_regions", "err")
 	RegionCacheCounterWithGetStoreOK = TiKVRegionCacheCounter.WithLabelValues("get_store", "ok")
 	RegionCacheCounterWithGetStoreError = TiKVRegionCacheCounter.WithLabelValues("get_store", "err")
 	RegionCacheCounterWithInvalidateStoreRegionsOK = TiKVRegionCacheCounter.WithLabelValues("invalidate_store_regions", "ok")
@@ -254,6 +269,7 @@ func initShortcuts() {
 	LoadRegionCacheHistogramWhenCacheMiss = TiKVLoadRegionCacheHistogram.WithLabelValues("get_region_when_miss")
 	LoadRegionCacheHistogramWithRegionByID = TiKVLoadRegionCacheHistogram.WithLabelValues("get_region_by_id")
 	LoadRegionCacheHistogramWithRegions = TiKVLoadRegionCacheHistogram.WithLabelValues("scan_regions")
+	LoadRegionCacheHistogramWithBatchScanRegions = TiKVLoadRegionCacheHistogram.WithLabelValues("batch_scan_regions")
 	LoadRegionCacheHistogramWithGetStore = TiKVLoadRegionCacheHistogram.WithLabelValues("get_store")
 
 	TxnHeartBeatHistogramOK = TiKVTxnHeartBeatHistogram.WithLabelValues("ok")
@@ -275,8 +291,9 @@ func initShortcuts() {
 	OnePCTxnCounterError = TiKVOnePCTxnCounter.WithLabelValues("err")
 	OnePCTxnCounterFallback = TiKVOnePCTxnCounter.WithLabelValues("fallback")
 
-	BatchRecvHistogramOK = TiKVBatchRecvLatency.WithLabelValues("ok")
-	BatchRecvHistogramError = TiKVBatchRecvLatency.WithLabelValues("err")
+	BatchRequestDurationSend = TiKVBatchRequestDuration.WithLabelValues("send")
+	BatchRequestDurationRecv = TiKVBatchRequestDuration.WithLabelValues("recv")
+	BatchRequestDurationDone = TiKVBatchRequestDuration.WithLabelValues("done")
 
 	PrewriteAssertionUsageCounterNone = TiKVPrewriteAssertionUsageCounter.WithLabelValues("none")
 	PrewriteAssertionUsageCounterExist = TiKVPrewriteAssertionUsageCounter.WithLabelValues("exist")
@@ -296,8 +313,14 @@ func initShortcuts() {
 	// TiKV).
 	AggressiveLockedKeysNonForceLock = TiKVAggressiveLockedKeysCounter.WithLabelValues("non_force_lock")
 
-	StaleReadHitInTraffic = TiKVStaleReadSizeSummary.WithLabelValues("hit", "in")
-	StaleReadHitOutTraffic = TiKVStaleReadSizeSummary.WithLabelValues("hit", "out")
-	StaleReadMissInTraffic = TiKVStaleReadSizeSummary.WithLabelValues("miss", "in")
-	StaleReadMissOutTraffic = TiKVStaleReadSizeSummary.WithLabelValues("miss", "out")
+	StaleReadHitCounter = TiKVStaleReadCounter.WithLabelValues("hit")
+	StaleReadMissCounter = TiKVStaleReadCounter.WithLabelValues("miss")
+
+	StaleReadReqLocalCounter = TiKVStaleReadReqCounter.WithLabelValues("local")
+	StaleReadReqCrossZoneCounter = TiKVStaleReadReqCounter.WithLabelValues("cross-zone")
+
+	StaleReadLocalInBytes = TiKVStaleReadBytes.WithLabelValues("local", "in")
+	StaleReadLocalOutBytes = TiKVStaleReadBytes.WithLabelValues("local", "out")
+	StaleReadRemoteInBytes = TiKVStaleReadBytes.WithLabelValues("cross-zone", "in")
+	StaleReadRemoteOutBytes = TiKVStaleReadBytes.WithLabelValues("cross-zone", "out")
 }

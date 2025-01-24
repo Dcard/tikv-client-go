@@ -36,6 +36,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"time"
 
 	"google.golang.org/grpc/encoding/gzip"
@@ -43,7 +44,22 @@ import (
 
 const (
 	// DefStoreLivenessTimeout is the default value for store liveness timeout.
-	DefStoreLivenessTimeout = "1s"
+	DefStoreLivenessTimeout       = "1s"
+	DefGrpcInitialWindowSize      = 1 << 27 // 128MiB
+	DefGrpcInitialConnWindowSize  = 1 << 27 // 128MiB
+	DefMaxConcurrencyRequestLimit = math.MaxInt64
+	DefBatchPolicy                = BatchPolicyStandard
+)
+
+const (
+	// BatchPolicyBasic is the basic batch policy whose behavior is consistent with versions before v8.3.0.
+	BatchPolicyBasic = "basic"
+	// BatchPolicyStandard dynamically batches requests based the arrival time intervals of recent requests.
+	BatchPolicyStandard = "standard"
+	// BatchPolicyPositive always performs additional batching.
+	BatchPolicyPositive = "positive"
+	// BatchPolicyCustom allows users to customize the internal batch options.
+	BatchPolicyCustom = "custom"
 )
 
 // TiKVClient is the config for tikv client.
@@ -56,12 +72,21 @@ type TiKVClient struct {
 	GrpcKeepAliveTime uint `toml:"grpc-keepalive-time" json:"grpc-keepalive-time"`
 	// After having pinged for keepalive check, the client waits for a duration of Timeout in seconds
 	// and if no activity is seen even after that the connection is closed.
-	GrpcKeepAliveTimeout uint `toml:"grpc-keepalive-timeout" json:"grpc-keepalive-timeout"`
+	GrpcKeepAliveTimeout float64 `toml:"grpc-keepalive-timeout" json:"grpc-keepalive-timeout"`
 	// GrpcCompressionType is the compression type for gRPC channel: none or gzip.
 	GrpcCompressionType string `toml:"grpc-compression-type" json:"grpc-compression-type"`
+	// GrpcSharedBufferPool is the flag to control whether to share the buffer pool in the TiKV gRPC clients.
+	GrpcSharedBufferPool bool `toml:"grpc-shared-buffer-pool" json:"grpc-shared-buffer-pool"`
+	// GrpcInitialWindowSize is the value for initial window size on a stream.
+	GrpcInitialWindowSize int32 `toml:"grpc-initial-window-size" json:"grpc-initial-window-size"`
+	// GrpcInitialConnWindowSize is the value for initial window size on a connection.
+	GrpcInitialConnWindowSize int32 `toml:"grpc-initial-conn-window-size" json:"grpc-initial-conn-window-size"`
 	// CommitTimeout is the max time which command 'commit' will wait.
 	CommitTimeout string      `toml:"commit-timeout" json:"commit-timeout"`
 	AsyncCommit   AsyncCommit `toml:"async-commit" json:"async-commit"`
+
+	// BatchPolicy is the policy for batching requests.
+	BatchPolicy string `toml:"batch-policy" json:"batch-policy"`
 	// MaxBatchSize is the max batch size when calling batch commands API.
 	MaxBatchSize uint `toml:"max-batch-size" json:"max-batch-size"`
 	// If TiKV load is greater than this, TiDB will wait for a while to avoid little batch.
@@ -87,6 +112,12 @@ type TiKVClient struct {
 	// TTLRefreshedTxnSize controls whether a transaction should update its TTL or not.
 	TTLRefreshedTxnSize      int64  `toml:"ttl-refreshed-txn-size" json:"ttl-refreshed-txn-size"`
 	ResolveLockLiteThreshold uint64 `toml:"resolve-lock-lite-threshold" json:"resolve-lock-lite-threshold"`
+	// MaxConcurrencyRequestLimit is the max concurrency number of request to be sent the tikv
+	// 0 means auto adjust by feedback.
+	MaxConcurrencyRequestLimit int64 `toml:"max-concurrency-request-limit" json:"max-concurrency-request-limit"`
+	// EnableReplicaSelectorV2 was deprecated.
+	// TODO(crazycs520): remove this config in 8.6 LTS version.
+	EnableReplicaSelectorV2 bool `toml:"enable-replica-selector-v2" json:"enable-replica-selector-v2"`
 }
 
 // AsyncCommit is the config for the async commit feature. The switch to enable it is a system variable.
@@ -121,11 +152,14 @@ type CoprocessorCache struct {
 // DefaultTiKVClient returns default config for TiKVClient.
 func DefaultTiKVClient() TiKVClient {
 	return TiKVClient{
-		GrpcConnectionCount:  4,
-		GrpcKeepAliveTime:    10,
-		GrpcKeepAliveTimeout: 3,
-		GrpcCompressionType:  "none",
-		CommitTimeout:        "41s",
+		GrpcConnectionCount:       4,
+		GrpcKeepAliveTime:         10,
+		GrpcKeepAliveTimeout:      3,
+		GrpcCompressionType:       "none",
+		GrpcSharedBufferPool:      false,
+		GrpcInitialWindowSize:     DefGrpcInitialWindowSize,
+		GrpcInitialConnWindowSize: DefGrpcInitialConnWindowSize,
+		CommitTimeout:             "41s",
 		AsyncCommit: AsyncCommit{
 			// FIXME: Find an appropriate default limit.
 			KeysLimit:         256,
@@ -134,6 +168,7 @@ func DefaultTiKVClient() TiKVClient {
 			AllowedClockDrift: 500 * time.Millisecond,
 		},
 
+		BatchPolicy:       DefBatchPolicy,
 		MaxBatchSize:      128,
 		OverloadThreshold: 200,
 		MaxBatchWaitTime:  0,
@@ -155,7 +190,9 @@ func DefaultTiKVClient() TiKVClient {
 		},
 		CoprReqTimeout: 60 * time.Second,
 
-		ResolveLockLiteThreshold: 16,
+		ResolveLockLiteThreshold:   16,
+		MaxConcurrencyRequestLimit: DefMaxConcurrencyRequestLimit,
+		EnableReplicaSelectorV2:    true,
 	}
 }
 
@@ -167,5 +204,12 @@ func (config *TiKVClient) Valid() error {
 	if config.GrpcCompressionType != "none" && config.GrpcCompressionType != gzip.Name {
 		return fmt.Errorf("grpc-compression-type should be none or %s, but got %s", gzip.Name, config.GrpcCompressionType)
 	}
+	if config.GetGrpcKeepAliveTimeout() < time.Millisecond*50 {
+		return fmt.Errorf("grpc-keepalive-timeout should be at least 0.05, but got %f", config.GrpcKeepAliveTimeout)
+	}
 	return nil
+}
+
+func (config *TiKVClient) GetGrpcKeepAliveTimeout() time.Duration {
+	return time.Duration(config.GrpcKeepAliveTimeout * float64(time.Second))
 }

@@ -32,18 +32,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package unionstore
+package rbt
 
 import (
 	"bytes"
 
+	"github.com/tikv/client-go/v2/internal/unionstore/arena"
 	"github.com/tikv/client-go/v2/kv"
 )
 
-// MemdbIterator is an Iterator with KeyFlags related functions.
-type MemdbIterator struct {
-	db           *MemDB
-	curr         memdbNodeAddr
+// RBTIterator is an Iterator with KeyFlags related functions.
+type RBTIterator struct {
+	db           *RBT
+	curr         MemdbNodeAddr
 	start        []byte
 	end          []byte
 	reverse      bool
@@ -54,8 +55,8 @@ type MemdbIterator struct {
 // If such entry is not found, it returns an invalid Iterator with no error.
 // It yields only keys that < upperBound. If upperBound is nil, it means the upperBound is unbounded.
 // The Iterator must be Closed after use.
-func (db *MemDB) Iter(k []byte, upperBound []byte) (Iterator, error) {
-	i := &MemdbIterator{
+func (db *RBT) Iter(k []byte, upperBound []byte) (*RBTIterator, error) {
+	i := &RBTIterator{
 		db:    db,
 		start: k,
 		end:   upperBound,
@@ -67,10 +68,11 @@ func (db *MemDB) Iter(k []byte, upperBound []byte) (Iterator, error) {
 // IterReverse creates a reversed Iterator positioned on the first entry which key is less than k.
 // The returned iterator will iterate from greater key to smaller key.
 // If k is nil, the returned iterator will be positioned at the last key.
-// TODO: Add lower bound limit
-func (db *MemDB) IterReverse(k []byte) (Iterator, error) {
-	i := &MemdbIterator{
+// It yields only keys that >= lowerBound. If lowerBound is nil, it means the lowerBound is unbounded.
+func (db *RBT) IterReverse(k []byte, lowerBound []byte) (*RBTIterator, error) {
+	i := &RBTIterator{
 		db:      db,
+		start:   lowerBound,
 		end:     k,
 		reverse: true,
 	}
@@ -78,9 +80,9 @@ func (db *MemDB) IterReverse(k []byte) (Iterator, error) {
 	return i, nil
 }
 
-// IterWithFlags returns a MemdbIterator.
-func (db *MemDB) IterWithFlags(k []byte, upperBound []byte) *MemdbIterator {
-	i := &MemdbIterator{
+// IterWithFlags returns a RBTIterator.
+func (db *RBT) IterWithFlags(k []byte, upperBound []byte) *RBTIterator {
+	i := &RBTIterator{
 		db:           db,
 		start:        k,
 		end:          upperBound,
@@ -90,9 +92,9 @@ func (db *MemDB) IterWithFlags(k []byte, upperBound []byte) *MemdbIterator {
 	return i
 }
 
-// IterReverseWithFlags returns a reversed MemdbIterator.
-func (db *MemDB) IterReverseWithFlags(k []byte) *MemdbIterator {
-	i := &MemdbIterator{
+// IterReverseWithFlags returns a reversed RBTIterator.
+func (db *RBT) IterReverseWithFlags(k []byte) *RBTIterator {
+	i := &RBTIterator{
 		db:           db,
 		end:          k,
 		reverse:      true,
@@ -102,7 +104,7 @@ func (db *MemDB) IterReverseWithFlags(k []byte) *MemdbIterator {
 	return i
 }
 
-func (i *MemdbIterator) init() {
+func (i *RBTIterator) init() {
 	if i.reverse {
 		if len(i.end) == 0 {
 			i.seekToLast()
@@ -117,62 +119,63 @@ func (i *MemdbIterator) init() {
 		}
 	}
 
-	if i.isFlagsOnly() && !i.includeFlags {
+	if (i.isFlagsOnly() && !i.includeFlags) || (!i.curr.isNull() && i.curr.isDeleted()) {
 		err := i.Next()
 		_ = err // memdbIterator will never fail
 	}
 }
 
 // Valid returns true if the current iterator is valid.
-func (i *MemdbIterator) Valid() bool {
+func (i *RBTIterator) Valid() bool {
 	if !i.reverse {
 		return !i.curr.isNull() && (i.end == nil || bytes.Compare(i.Key(), i.end) < 0)
 	}
-	return !i.curr.isNull()
+	return !i.curr.isNull() && (i.start == nil || bytes.Compare(i.Key(), i.start) >= 0)
 }
 
 // Flags returns flags belong to current iterator.
-func (i *MemdbIterator) Flags() kv.KeyFlags {
+func (i *RBTIterator) Flags() kv.KeyFlags {
 	return i.curr.getKeyFlags()
 }
 
 // UpdateFlags updates and apply with flagsOp.
-func (i *MemdbIterator) UpdateFlags(ops ...kv.FlagsOp) {
+func (i *RBTIterator) UpdateFlags(ops ...kv.FlagsOp) {
 	origin := i.curr.getKeyFlags()
 	n := kv.ApplyFlagsOps(origin, ops...)
-	i.curr.setKeyFlags(n)
+	i.curr.resetKeyFlags(n)
 }
 
 // HasValue returns false if it is flags only.
-func (i *MemdbIterator) HasValue() bool {
+func (i *RBTIterator) HasValue() bool {
 	return !i.isFlagsOnly()
 }
 
 // Key returns current key.
-func (i *MemdbIterator) Key() []byte {
+func (i *RBTIterator) Key() []byte {
 	return i.curr.getKey()
 }
 
 // Handle returns MemKeyHandle with the current position.
-func (i *MemdbIterator) Handle() MemKeyHandle {
-	return MemKeyHandle{
-		idx: uint16(i.curr.addr.idx),
-		off: i.curr.addr.off,
-	}
+func (i *RBTIterator) Handle() arena.MemKeyHandle {
+	return i.curr.addr.ToHandle()
 }
 
 // Value returns the value.
-func (i *MemdbIterator) Value() []byte {
-	return i.db.vlog.getValue(i.curr.vptr)
+func (i *RBTIterator) Value() []byte {
+	return i.db.vlog.GetValue(i.curr.vptr)
 }
 
 // Next goes the next position.
-func (i *MemdbIterator) Next() error {
+func (i *RBTIterator) Next() error {
 	for {
 		if i.reverse {
 			i.curr = i.db.predecessor(i.curr)
 		} else {
 			i.curr = i.db.successor(i.curr)
+		}
+
+		if i.curr.isDeleted() {
+			continue
 		}
 
 		// We need to skip persistent flags only nodes.
@@ -184,10 +187,10 @@ func (i *MemdbIterator) Next() error {
 }
 
 // Close closes the current iterator.
-func (i *MemdbIterator) Close() {}
+func (i *RBTIterator) Close() {}
 
-func (i *MemdbIterator) seekToFirst() {
-	y := memdbNodeAddr{nil, nullAddr}
+func (i *RBTIterator) seekToFirst() {
+	y := MemdbNodeAddr{nil, arena.NullAddr}
 	x := i.db.getNode(i.db.root)
 
 	for !x.isNull() {
@@ -196,10 +199,13 @@ func (i *MemdbIterator) seekToFirst() {
 	}
 
 	i.curr = y
+	for !i.curr.isNull() && i.curr.isDeleted() {
+		i.curr = i.db.successor(i.curr)
+	}
 }
 
-func (i *MemdbIterator) seekToLast() {
-	y := memdbNodeAddr{nil, nullAddr}
+func (i *RBTIterator) seekToLast() {
+	y := MemdbNodeAddr{nil, arena.NullAddr}
 	x := i.db.getNode(i.db.root)
 
 	for !x.isNull() {
@@ -208,10 +214,13 @@ func (i *MemdbIterator) seekToLast() {
 	}
 
 	i.curr = y
+	for !i.curr.isNull() && i.curr.isDeleted() {
+		i.curr = i.db.predecessor(i.curr)
+	}
 }
 
-func (i *MemdbIterator) seek(key []byte) {
-	y := memdbNodeAddr{nil, nullAddr}
+func (i *RBTIterator) seek(key []byte) {
+	y := MemdbNodeAddr{nil, arena.NullAddr}
 	x := i.db.getNode(i.db.root)
 
 	var cmp int
@@ -245,6 +254,6 @@ func (i *MemdbIterator) seek(key []byte) {
 	i.curr = y
 }
 
-func (i *MemdbIterator) isFlagsOnly() bool {
-	return !i.curr.isNull() && i.curr.vptr.isNull()
+func (i *RBTIterator) isFlagsOnly() bool {
+	return !i.curr.isNull() && i.curr.vptr.IsNull()
 }

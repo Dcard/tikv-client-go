@@ -15,14 +15,13 @@
 package resourcecontrol
 
 import (
-	"reflect"
+	"strings"
 	"time"
 
 	"github.com/pingcap/kvproto/pkg/coprocessor"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
-	"github.com/tikv/client-go/v2/internal/logutil"
 	"github.com/tikv/client-go/v2/tikvrpc"
-	"go.uber.org/zap"
+	"github.com/tikv/client-go/v2/util"
 )
 
 // RequestInfo contains information about a request that is able to calculate the RU cost
@@ -34,12 +33,23 @@ type RequestInfo struct {
 	writeBytes    int64
 	storeID       uint64
 	replicaNumber int64
+	// bypass indicates whether the request should be bypassed.
+	// some internal request should be bypassed, such as Privilege request.
+	bypass bool
 }
 
 // MakeRequestInfo extracts the relevant information from a BatchRequest.
 func MakeRequestInfo(req *tikvrpc.Request) *RequestInfo {
+	var bypass bool
+	requestSource := req.Context.GetRequestSource()
+	if len(requestSource) > 0 {
+		if strings.Contains(requestSource, util.InternalRequestPrefix+util.InternalTxnOthers) {
+			bypass = true
+		}
+	}
+	storeID := req.Context.GetPeer().GetStoreId()
 	if !req.IsTxnWriteRequest() && !req.IsRawWriteRequest() {
-		return &RequestInfo{writeBytes: -1}
+		return &RequestInfo{writeBytes: -1, storeID: storeID, bypass: bypass}
 	}
 
 	var writeBytes int64
@@ -57,7 +67,7 @@ func MakeRequestInfo(req *tikvrpc.Request) *RequestInfo {
 			writeBytes += int64(len(k))
 		}
 	}
-	return &RequestInfo{writeBytes: writeBytes, storeID: req.Context.Peer.StoreId, replicaNumber: req.ReplicaNumber}
+	return &RequestInfo{writeBytes: writeBytes, storeID: storeID, replicaNumber: req.ReplicaNumber, bypass: bypass}
 }
 
 // IsWrite returns whether the request is a write request.
@@ -68,11 +78,19 @@ func (req *RequestInfo) IsWrite() bool {
 // WriteBytes returns the actual write size of the request,
 // -1 will be returned if it's not a write request.
 func (req *RequestInfo) WriteBytes() uint64 {
-	return uint64(req.writeBytes)
+	if req.writeBytes > 0 {
+		return uint64(req.writeBytes)
+	}
+	return 0
 }
 
 func (req *RequestInfo) ReplicaNumber() int64 {
 	return req.replicaNumber
+}
+
+// Bypass returns whether the request should be bypassed.
+func (req *RequestInfo) Bypass() bool {
+	return req.bypass
 }
 
 func (req *RequestInfo) StoreID() uint64 {
@@ -119,7 +137,6 @@ func MakeResponseInfo(resp *tikvrpc.Response) *ResponseInfo {
 		// TODO: using a more accurate size rather than using the whole response size as the read bytes.
 		readBytes = uint64(r.Size())
 	default:
-		logutil.BgLogger().Debug("[kv resource] unknown response type to collect the info", zap.Any("type", reflect.TypeOf(r)))
 		return &ResponseInfo{}
 	}
 	// Try to get read bytes from the `detailsV2`.

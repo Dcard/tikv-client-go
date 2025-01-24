@@ -44,18 +44,18 @@ type mockSnapshot struct {
 	store *MemDB
 }
 
-func (s *mockSnapshot) Get(_ context.Context, k []byte) ([]byte, error) {
-	return s.store.Get(k)
+func (s *mockSnapshot) Get(ctx context.Context, k []byte) ([]byte, error) {
+	return s.store.Get(ctx, k)
 }
 
 func (s *mockSnapshot) SetPriority(priority int) {
 
 }
 
-func (s *mockSnapshot) BatchGet(_ context.Context, keys [][]byte) (map[string][]byte, error) {
+func (s *mockSnapshot) BatchGet(ctx context.Context, keys [][]byte) (map[string][]byte, error) {
 	m := make(map[string][]byte, len(keys))
 	for _, k := range keys {
-		v, err := s.store.Get(k)
+		v, err := s.store.Get(ctx, k)
 		if tikverr.IsErrNotFound(err) {
 			continue
 		}
@@ -71,8 +71,8 @@ func (s *mockSnapshot) Iter(k []byte, upperBound []byte) (Iterator, error) {
 	return s.store.Iter(k, upperBound)
 }
 
-func (s *mockSnapshot) IterReverse(k []byte) (Iterator, error) {
-	return s.store.IterReverse(k)
+func (s *mockSnapshot) IterReverse(k, lowerBound []byte) (Iterator, error) {
+	return s.store.IterReverse(k, lowerBound)
 }
 
 func (s *mockSnapshot) SetOption(opt int, val interface{}) {}

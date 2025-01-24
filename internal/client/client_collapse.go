@@ -87,7 +87,7 @@ func (r reqCollapse) tryCollapseRequest(ctx context.Context, addr string, req *t
 			return
 		}
 		canCollapse = true
-		key := strconv.FormatUint(resolveLock.Context.RegionId, 10) + "-" + strconv.FormatUint(resolveLock.StartVersion, 10)
+		key := strconv.FormatUint(req.Context.RegionId, 10) + "-" + strconv.FormatUint(resolveLock.StartVersion, 10)
 		resp, err = r.collapse(ctx, key, &resolveRegionSf, addr, req, timeout)
 		return
 	default:
@@ -98,8 +98,10 @@ func (r reqCollapse) tryCollapseRequest(ctx context.Context, addr string, req *t
 
 func (r reqCollapse) collapse(ctx context.Context, key string, sf *singleflight.Group,
 	addr string, req *tikvrpc.Request, timeout time.Duration) (resp *tikvrpc.Response, err error) {
+	// because the request may be used by other goroutines, copy the request to avoid data race.
+	copyReq := *req
 	rsC := sf.DoChan(key, func() (interface{}, error) {
-		return r.Client.SendRequest(context.Background(), addr, req, ReadTimeoutShort) // use resolveLock timeout.
+		return r.Client.SendRequest(context.Background(), addr, &copyReq, ReadTimeoutShort) // use resolveLock timeout.
 	})
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()

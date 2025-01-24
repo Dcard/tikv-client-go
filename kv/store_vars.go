@@ -35,6 +35,8 @@
 package kv
 
 import (
+	"fmt"
+
 	"go.uber.org/atomic"
 )
 
@@ -72,3 +74,29 @@ const (
 func (r ReplicaReadType) IsFollowerRead() bool {
 	return r != ReplicaReadLeader
 }
+
+// String implements fmt.Stringer interface.
+func (r ReplicaReadType) String() string {
+	switch r {
+	case ReplicaReadLeader:
+		return "leader"
+	case ReplicaReadFollower:
+		return "follower"
+	case ReplicaReadMixed:
+		return "mixed"
+	case ReplicaReadLearner:
+		return "learner"
+	case ReplicaReadPreferLeader:
+		return "prefer-leader"
+	default:
+		return fmt.Sprintf("unknown-%v", byte(r))
+	}
+}
+
+type AccessLocationType byte
+
+const (
+	AccessUnknown AccessLocationType = iota
+	AccessLocalZone
+	AccessCrossZone
+)

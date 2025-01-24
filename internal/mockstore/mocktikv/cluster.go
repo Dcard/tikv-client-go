@@ -38,6 +38,7 @@ import (
 	"bytes"
 	"context"
 	"math"
+	"slices"
 	"sort"
 	"sync"
 	"time"
@@ -46,7 +47,9 @@ import (
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/tikv/client-go/v2/internal/mockstore/cluster"
-	pd "github.com/tikv/pd/client"
+	"github.com/tikv/client-go/v2/util"
+	"github.com/tikv/pd/client/clients/router"
+	"github.com/tikv/pd/client/opt"
 )
 
 var _ cluster.Cluster = &Cluster{}
@@ -63,9 +66,10 @@ var _ cluster.Cluster = &Cluster{}
 //     to client's request.
 type Cluster struct {
 	sync.RWMutex
-	id      uint64
-	stores  map[uint64]*Store
-	regions map[uint64]*Region
+	id        uint64
+	stores    map[uint64]*Store
+	regions   map[uint64]*Region
+	downPeers map[uint64]struct{}
 
 	mvccStore MVCCStore
 
@@ -85,6 +89,7 @@ func NewCluster(mvccStore MVCCStore) *Cluster {
 	return &Cluster{
 		stores:      make(map[uint64]*Store),
 		regions:     make(map[uint64]*Region),
+		downPeers:   make(map[uint64]struct{}),
 		delayEvents: make(map[delayKey]time.Duration),
 		mvccStore:   mvccStore,
 	}
@@ -244,6 +249,18 @@ func (c *Cluster) MarkTombstone(storeID uint64) {
 	c.stores[storeID].meta = &nm
 }
 
+func (c *Cluster) MarkPeerDown(peerID uint64) {
+	c.Lock()
+	defer c.Unlock()
+	c.downPeers[peerID] = struct{}{}
+}
+
+func (c *Cluster) RemoveDownPeer(peerID uint64) {
+	c.Lock()
+	defer c.Unlock()
+	delete(c.downPeers, peerID)
+}
+
 // UpdateStoreAddr updates store address for cluster.
 func (c *Cluster) UpdateStoreAddr(storeID uint64, addr string, labels ...*metapb.StoreLabel) {
 	c.Lock()
@@ -272,7 +289,7 @@ func (c *Cluster) GetRegion(regionID uint64) (*metapb.Region, uint64) {
 }
 
 // GetRegionByKey returns the Region and its leader whose range contains the key.
-func (c *Cluster) GetRegionByKey(key []byte) (*metapb.Region, *metapb.Peer, *metapb.Buckets) {
+func (c *Cluster) GetRegionByKey(key []byte) (*metapb.Region, *metapb.Peer, *metapb.Buckets, []*metapb.Peer) {
 	c.RLock()
 	defer c.RUnlock()
 
@@ -280,47 +297,62 @@ func (c *Cluster) GetRegionByKey(key []byte) (*metapb.Region, *metapb.Peer, *met
 }
 
 // getRegionByKeyNoLock returns the Region and its leader whose range contains the key without Lock.
-func (c *Cluster) getRegionByKeyNoLock(key []byte) (*metapb.Region, *metapb.Peer, *metapb.Buckets) {
+func (c *Cluster) getRegionByKeyNoLock(key []byte) (*metapb.Region, *metapb.Peer, *metapb.Buckets, []*metapb.Peer) {
 	for _, r := range c.regions {
 		if regionContains(r.Meta.StartKey, r.Meta.EndKey, key) {
-			return proto.Clone(r.Meta).(*metapb.Region), proto.Clone(r.leaderPeer()).(*metapb.Peer), proto.Clone(r.Buckets).(*metapb.Buckets)
+			return proto.Clone(r.Meta).(*metapb.Region), proto.Clone(r.leaderPeer()).(*metapb.Peer),
+				proto.Clone(r.Buckets).(*metapb.Buckets), c.getDownPeers(r)
 		}
 	}
-	return nil, nil, nil
+	return nil, nil, nil, nil
 }
 
 // GetPrevRegionByKey returns the previous Region and its leader whose range contains the key.
-func (c *Cluster) GetPrevRegionByKey(key []byte) (*metapb.Region, *metapb.Peer, *metapb.Buckets) {
+func (c *Cluster) GetPrevRegionByKey(key []byte) (*metapb.Region, *metapb.Peer, *metapb.Buckets, []*metapb.Peer) {
 	c.RLock()
 	defer c.RUnlock()
 
-	currentRegion, _, _ := c.getRegionByKeyNoLock(key)
+	currentRegion, _, _, _ := c.getRegionByKeyNoLock(key)
 	if len(currentRegion.StartKey) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 	for _, r := range c.regions {
 		if bytes.Equal(r.Meta.EndKey, currentRegion.StartKey) {
-			return proto.Clone(r.Meta).(*metapb.Region), proto.Clone(r.leaderPeer()).(*metapb.Peer), proto.Clone(r.Buckets).(*metapb.Buckets)
+			return proto.Clone(r.Meta).(*metapb.Region), proto.Clone(r.leaderPeer()).(*metapb.Peer),
+				proto.Clone(r.Buckets).(*metapb.Buckets), c.getDownPeers(r)
 		}
 	}
-	return nil, nil, nil
+	return nil, nil, nil, nil
+}
+
+func (c *Cluster) getDownPeers(region *Region) []*metapb.Peer {
+	var downPeers []*metapb.Peer
+	for peerID := range c.downPeers {
+		for _, peer := range region.Meta.Peers {
+			if peer.GetId() == peerID {
+				downPeers = append(downPeers, proto.Clone(peer).(*metapb.Peer))
+			}
+		}
+	}
+	return downPeers
 }
 
 // GetRegionByID returns the Region and its leader whose ID is regionID.
-func (c *Cluster) GetRegionByID(regionID uint64) (*metapb.Region, *metapb.Peer, *metapb.Buckets) {
+func (c *Cluster) GetRegionByID(regionID uint64) (*metapb.Region, *metapb.Peer, *metapb.Buckets, []*metapb.Peer) {
 	c.RLock()
 	defer c.RUnlock()
 
 	for _, r := range c.regions {
 		if r.Meta.GetId() == regionID {
-			return proto.Clone(r.Meta).(*metapb.Region), proto.Clone(r.leaderPeer()).(*metapb.Peer), proto.Clone(r.Buckets).(*metapb.Buckets)
+			return proto.Clone(r.Meta).(*metapb.Region), proto.Clone(r.leaderPeer()).(*metapb.Peer),
+				proto.Clone(r.Buckets).(*metapb.Buckets), c.getDownPeers(r)
 		}
 	}
-	return nil, nil, nil
+	return nil, nil, nil, nil
 }
 
 // ScanRegions returns at most `limit` regions from given `key` and their leaders.
-func (c *Cluster) ScanRegions(startKey, endKey []byte, limit int) []*pd.Region {
+func (c *Cluster) ScanRegions(startKey, endKey []byte, limit int, opts ...opt.GetRegionOption) []*router.Region {
 	c.RLock()
 	defer c.RUnlock()
 
@@ -329,8 +361,8 @@ func (c *Cluster) ScanRegions(startKey, endKey []byte, limit int) []*pd.Region {
 		regions = append(regions, region)
 	}
 
-	sort.Slice(regions, func(i, j int) bool {
-		return bytes.Compare(regions[i].Meta.GetStartKey(), regions[j].Meta.GetStartKey()) < 0
+	slices.SortFunc(regions, func(i, j *Region) int {
+		return bytes.Compare(i.Meta.GetStartKey(), j.Meta.GetStartKey())
 	})
 
 	startPos := sort.Search(len(regions), func(i int) bool {
@@ -348,11 +380,20 @@ func (c *Cluster) ScanRegions(startKey, endKey []byte, limit int) []*pd.Region {
 			regions = regions[:endPos]
 		}
 	}
+	if rid, err := util.EvalFailpoint("mockSplitRegionNotReportToPD"); err == nil {
+		notReportRegionID := uint64(rid.(int))
+		for i, r := range regions {
+			if r.Meta.Id == notReportRegionID {
+				regions = append(regions[:i], regions[i+1:]...)
+				break
+			}
+		}
+	}
 	if limit > 0 && len(regions) > limit {
 		regions = regions[:limit]
 	}
 
-	result := make([]*pd.Region, 0, len(regions))
+	result := make([]*router.Region, 0, len(regions))
 	for _, region := range regions {
 		leader := region.leaderPeer()
 		if leader == nil {
@@ -361,9 +402,11 @@ func (c *Cluster) ScanRegions(startKey, endKey []byte, limit int) []*pd.Region {
 			leader = proto.Clone(leader).(*metapb.Peer)
 		}
 
-		r := &pd.Region{
-			Meta:   proto.Clone(region.Meta).(*metapb.Region),
-			Leader: leader,
+		r := &router.Region{
+			Meta:      proto.Clone(region.Meta).(*metapb.Region),
+			Leader:    leader,
+			DownPeers: c.getDownPeers(region),
+			Buckets:   proto.Clone(region.Buckets).(*metapb.Buckets),
 		}
 		result = append(result, r)
 	}
@@ -383,21 +426,37 @@ func (c *Cluster) Bootstrap(regionID uint64, storeIDs, peerIDs []uint64, leaderP
 	c.regions[regionID] = newRegion(regionID, storeIDs, peerIDs, leaderPeerID)
 }
 
+// PutRegion adds or replaces a region.
+func (c *Cluster) PutRegion(regionID, confVer, ver uint64, storeIDs, peerIDs []uint64, leaderPeerID uint64) {
+	c.Lock()
+	defer c.Unlock()
+
+	c.regions[regionID] = newRegion(regionID, storeIDs, peerIDs, leaderPeerID, confVer, ver)
+}
+
 // AddPeer adds a new Peer for the Region on the Store.
 func (c *Cluster) AddPeer(regionID, storeID, peerID uint64) {
 	c.Lock()
 	defer c.Unlock()
 
-	c.regions[regionID].addPeer(peerID, storeID)
+	c.regions[regionID].addPeer(peerID, storeID, metapb.PeerRole_Voter)
+}
+
+// AddLearner adds a new learner for the Region on the Store.
+func (c *Cluster) AddLearner(regionID, storeID, peerID uint64) {
+	c.Lock()
+	defer c.Unlock()
+
+	c.regions[regionID].addPeer(peerID, storeID, metapb.PeerRole_Learner)
 }
 
 // RemovePeer removes the Peer from the Region. Note that if the Peer is leader,
 // the Region will have no leader before calling ChangeLeader().
-func (c *Cluster) RemovePeer(regionID, storeID uint64) {
+func (c *Cluster) RemovePeer(regionID, peerID uint64) {
 	c.Lock()
 	defer c.Unlock()
 
-	c.regions[regionID].removePeer(storeID)
+	c.regions[regionID].removePeer(peerID)
 }
 
 // ChangeLeader sets the Region's leader Peer. Caller should guarantee the Peer
@@ -604,7 +663,7 @@ func newPeerMeta(peerID, storeID uint64) *metapb.Peer {
 	}
 }
 
-func newRegion(regionID uint64, storeIDs, peerIDs []uint64, leaderPeerID uint64) *Region {
+func newRegion(regionID uint64, storeIDs, peerIDs []uint64, leaderPeerID uint64, epoch ...uint64) *Region {
 	if len(storeIDs) != len(peerIDs) {
 		panic("len(storeIDs) != len(peerIds)")
 	}
@@ -617,14 +676,20 @@ func newRegion(regionID uint64, storeIDs, peerIDs []uint64, leaderPeerID uint64)
 		Peers:       peers,
 		RegionEpoch: &metapb.RegionEpoch{},
 	}
+	if len(epoch) == 2 {
+		meta.RegionEpoch.ConfVer = epoch[0]
+		meta.RegionEpoch.Version = epoch[1]
+	}
 	return &Region{
 		Meta:   meta,
 		leader: leaderPeerID,
 	}
 }
 
-func (r *Region) addPeer(peerID, storeID uint64) {
-	r.Meta.Peers = append(r.Meta.Peers, newPeerMeta(peerID, storeID))
+func (r *Region) addPeer(peerID, storeID uint64, role metapb.PeerRole) {
+	peer := newPeerMeta(peerID, storeID)
+	peer.Role = role
+	r.Meta.Peers = append(r.Meta.Peers, peer)
 	r.incConfVer()
 }
 

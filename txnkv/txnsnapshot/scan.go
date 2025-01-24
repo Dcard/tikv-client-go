@@ -40,11 +40,11 @@ import (
 
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pkg/errors"
+	"github.com/tikv/client-go/v2/config/retry"
 	tikverr "github.com/tikv/client-go/v2/error"
 	"github.com/tikv/client-go/v2/internal/client"
 	"github.com/tikv/client-go/v2/internal/locate"
 	"github.com/tikv/client-go/v2/internal/logutil"
-	"github.com/tikv/client-go/v2/internal/retry"
 	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/tikvrpc"
 	"github.com/tikv/client-go/v2/tikvrpc/interceptor"
@@ -146,7 +146,7 @@ func (s *Scanner) Next() error {
 		}
 
 		current := s.cache[s.idx]
-		if (!s.reverse && (len(s.endKey) > 0 && kv.CmpKey(current.Key, s.endKey) >= 0)) ||
+		if (!s.reverse && len(s.endKey) > 0 && kv.CmpKey(current.Key, s.endKey) >= 0) ||
 			(s.reverse && len(s.nextStartKey) > 0 && kv.CmpKey(current.Key, s.nextStartKey) < 0) {
 			s.eof = true
 			s.Close()
@@ -197,11 +197,13 @@ func (s *Scanner) getData(bo *retry.Backoffer) error {
 		zap.String("nextEndKey", kv.StrKey(s.nextEndKey)),
 		zap.Bool("reverse", s.reverse),
 		zap.Uint64("txnStartTS", s.startTS()))
-	sender := locate.NewRegionRequestSender(s.snapshot.store.GetRegionCache(), s.snapshot.store.GetTiKVClient())
+	sender := locate.NewRegionRequestSender(s.snapshot.store.GetRegionCache(), s.snapshot.store.GetTiKVClient(), s.snapshot.store.GetOracle())
 	var reqEndKey, reqStartKey []byte
 	var loc *locate.KeyLocation
 	var resolvingRecordToken *int
 	var err error
+	// the states in request need to keep when retry request.
+	var readType string
 	for {
 		if !s.reverse {
 			loc, err = s.snapshot.store.GetRegionCache().LocateKey(bo, s.nextStartKey)
@@ -245,12 +247,16 @@ func (s *Scanner) getData(bo *retry.Backoffer) error {
 			TaskId:           s.snapshot.mu.taskID,
 			ResourceGroupTag: s.snapshot.mu.resourceGroupTag,
 			IsolationLevel:   s.snapshot.isolationLevel.ToPB(),
-			RequestSource:    s.snapshot.GetRequestSource(),
 			ResourceControlContext: &kvrpcpb.ResourceControlContext{
 				ResourceGroupName: s.snapshot.mu.resourceGroupName,
 			},
 			BusyThresholdMs: uint32(s.snapshot.mu.busyThreshold.Milliseconds()),
 		})
+		if readType != "" {
+			req.ReadType = readType
+			req.IsRetryRequest = true
+		}
+		req.InputRequestSource = s.snapshot.GetRequestSource()
 		if s.snapshot.mu.resourceGroupTag == nil && s.snapshot.mu.resourceGroupTagger != nil {
 			s.snapshot.mu.resourceGroupTagger(req)
 		}
@@ -263,6 +269,7 @@ func (s *Scanner) getData(bo *retry.Backoffer) error {
 		if err != nil {
 			return err
 		}
+		readType = req.ReadType
 		if regionErr != nil {
 			logutil.BgLogger().Debug("scanner getData failed",
 				zap.Stringer("regionErr", regionErr))

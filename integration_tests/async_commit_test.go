@@ -39,12 +39,13 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
-	"github.com/pingcap/tidb/store/mockstore/unistore"
+	"github.com/pingcap/tidb/pkg/store/mockstore/unistore"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/suite"
 	tikverr "github.com/tikv/client-go/v2/error"
@@ -76,9 +77,7 @@ type unistoreClientWrapper struct {
 	*unistore.RPCClient
 }
 
-func (c *unistoreClientWrapper) CloseAddr(addr string) error {
-	return nil
-}
+func (c *unistoreClientWrapper) SetEventListener(listener tikv.ClientEventListener) {}
 
 func (s *testAsyncCommitCommon) setUpTest() {
 	if *withTiKV {
@@ -86,7 +85,7 @@ func (s *testAsyncCommitCommon) setUpTest() {
 		return
 	}
 
-	client, pdClient, cluster, err := unistore.New("")
+	client, pdClient, cluster, err := unistore.New("", nil)
 	s.Require().Nil(err)
 
 	unistore.BootstrapWithSingleStore(cluster)
@@ -113,7 +112,7 @@ func (s *testAsyncCommitCommon) putKV(key, value []byte, enableAsyncCommit bool)
 	s.Nil(err)
 	err = txn.Commit(context.Background())
 	s.Nil(err)
-	return txn.StartTS(), txn.GetCommitTS()
+	return txn.StartTS(), txn.CommitTS()
 }
 
 func (s *testAsyncCommitCommon) mustGetFromTxn(txn transaction.TxnProbe, key, expectedValue []byte) {
@@ -441,8 +440,8 @@ func (s *testAsyncCommitSuite) TestAsyncCommitLinearizability() {
 	s.Nil(err)
 	err = t1.Commit(ctx)
 	s.Nil(err)
-	commitTS1 := t1.GetCommitTS()
-	commitTS2 := t2.GetCommitTS()
+	commitTS1 := t1.CommitTS()
+	commitTS2 := t2.CommitTS()
 	s.Less(commitTS2, commitTS1)
 }
 
@@ -633,4 +632,34 @@ func (s *testAsyncCommitSuite) TestRollbackAsyncCommitEnforcesFallback() {
 	s.True(committer.IsAsyncCommit())
 	committer.PrewriteMutations(context.Background(), committer.GetMutations().Slice(1, 2))
 	s.False(committer.IsAsyncCommit())
+}
+
+func (s *testAsyncCommitSuite) TestAsyncCommitLifecycleHooks() {
+	reachedPre := atomic.Bool{}
+	reachedPost := atomic.Bool{}
+
+	var wg sync.WaitGroup
+
+	t1 := s.beginAsyncCommit()
+	t1.SetBackgroundGoroutineLifecycleHooks(transaction.LifecycleHooks{
+		Pre: func() {
+			wg.Add(1)
+
+			reachedPre.Store(true)
+		},
+		Post: func() {
+			s.Equal(reachedPre.Load(), true)
+			reachedPost.Store(true)
+
+			wg.Done()
+		},
+	})
+	t1.Set([]byte("a"), []byte("a"))
+	t1.Set([]byte("z"), []byte("z"))
+	s.Nil(t1.Commit(context.Background()))
+
+	s.Equal(reachedPre.Load(), true)
+	s.Equal(reachedPost.Load(), false)
+	wg.Wait()
+	s.Equal(reachedPost.Load(), true)
 }

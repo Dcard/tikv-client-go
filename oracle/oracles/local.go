@@ -36,9 +36,11 @@ package oracles
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 
+	"github.com/pingcap/errors"
 	"github.com/tikv/client-go/v2/oracle"
 )
 
@@ -86,6 +88,16 @@ func (l *localOracle) GetTimestamp(ctx context.Context, _ *oracle.Option) (uint6
 	return ts, nil
 }
 
+func (l *localOracle) GetAllTSOKeyspaceGroupMinTS(ctx context.Context) (uint64, error) {
+	l.Lock()
+	defer l.Unlock()
+	now := time.Now()
+	if l.hook != nil {
+		now = l.hook.currentTime
+	}
+	return oracle.GoTimeToTS(now), nil
+}
+
 func (l *localOracle) GetTimestampAsync(ctx context.Context, _ *oracle.Option) oracle.Future {
 	return &future{
 		ctx: ctx,
@@ -99,6 +111,10 @@ func (l *localOracle) GetLowResolutionTimestamp(ctx context.Context, opt *oracle
 
 func (l *localOracle) GetLowResolutionTimestampAsync(ctx context.Context, opt *oracle.Option) oracle.Future {
 	return l.GetTimestampAsync(ctx, opt)
+}
+
+func (l *localOracle) SetLowResolutionTimestampUpdateInterval(time.Duration) error {
+	return nil
 }
 
 // GetStaleTimestamp return physical
@@ -133,4 +149,25 @@ func (l *localOracle) SetExternalTimestamp(ctx context.Context, newTimestamp uin
 
 func (l *localOracle) GetExternalTimestamp(ctx context.Context) (uint64, error) {
 	return l.getExternalTimestamp(ctx)
+}
+
+func (l *localOracle) ValidateReadTS(ctx context.Context, readTS uint64, isStaleRead bool, opt *oracle.Option) error {
+	if readTS == math.MaxUint64 {
+		if isStaleRead {
+			return oracle.ErrLatestStaleRead{}
+		}
+		return nil
+	}
+
+	currentTS, err := l.GetTimestamp(ctx, opt)
+	if err != nil {
+		return errors.Errorf("fail to validate read timestamp: %v", err)
+	}
+	if currentTS < readTS {
+		return oracle.ErrFutureTSRead{
+			ReadTS:    readTS,
+			CurrentTS: currentTS,
+		}
+	}
+	return nil
 }

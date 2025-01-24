@@ -46,6 +46,7 @@ import (
 	"github.com/tikv/client-go/v2/internal/logutil"
 	"github.com/tikv/client-go/v2/kv"
 	"github.com/tikv/client-go/v2/metrics"
+	"github.com/tikv/client-go/v2/util"
 	"go.uber.org/zap"
 )
 
@@ -95,6 +96,11 @@ func NewConfig(name string, metric *prometheus.Observer, backoffFnCfg *BackoffFn
 	}
 }
 
+// Base returns the base time of the backoff function.
+func (c *Config) Base() int {
+	return c.fnCfg.base
+}
+
 func (c *Config) String() string {
 	return c.name
 }
@@ -102,6 +108,10 @@ func (c *Config) String() string {
 // SetErrors sets a more detailed error instead of the default bo config.
 func (c *Config) SetErrors(err error) {
 	c.err = err
+}
+
+func (c *Config) SetBackoffFnCfg(fnCfg *BackoffFnCfg) {
+	c.fnCfg = fnCfg
 }
 
 const txnLockFastName = "txnLockFast"
@@ -123,16 +133,22 @@ var (
 	BoTxnNotFound              = NewConfig("txnNotFound", &metrics.BackoffHistogramEmpty, NewBackoffFnCfg(2, 500, NoJitter), tikverr.ErrResolveLockTimeout)
 	BoStaleCmd                 = NewConfig("staleCommand", &metrics.BackoffHistogramStaleCmd, NewBackoffFnCfg(2, 1000, NoJitter), tikverr.ErrTiKVStaleCommand)
 	BoMaxTsNotSynced           = NewConfig("maxTsNotSynced", &metrics.BackoffHistogramEmpty, NewBackoffFnCfg(2, 500, NoJitter), tikverr.ErrTiKVMaxTimestampNotSynced)
-	BoMaxDataNotReady          = NewConfig("dataNotReady", &metrics.BackoffHistogramDataNotReady, NewBackoffFnCfg(2, 2000, NoJitter), tikverr.ErrRegionDataNotReady)
 	BoMaxRegionNotInitialized  = NewConfig("regionNotInitialized", &metrics.BackoffHistogramEmpty, NewBackoffFnCfg(2, 1000, NoJitter), tikverr.ErrRegionNotInitialized)
 	BoIsWitness                = NewConfig("isWitness", &metrics.BackoffHistogramIsWitness, NewBackoffFnCfg(1000, 10000, EqualJitter), tikverr.ErrIsWitness)
 	// TxnLockFast's `base` load from vars.BackoffLockFast when create BackoffFn.
 	BoTxnLockFast = NewConfig(txnLockFastName, &metrics.BackoffHistogramLockFast, NewBackoffFnCfg(2, 3000, EqualJitter), tikverr.ErrResolveLockTimeout)
 )
 
-var isSleepExcluded = map[string]struct{}{
-	BoTiKVServerBusy.name: {},
+var isSleepExcluded = map[string]int{
+	BoTiKVServerBusy.name: 600000, // The max excluded limit is 10min.
 	// add BoTiFlashServerBusy if appropriate
+}
+
+// setBackoffExcluded is used for test only.
+func setBackoffExcluded(name string, maxVal int) {
+	if _, ok := isSleepExcluded[name]; ok {
+		isSleepExcluded[name] = maxVal
+	}
 }
 
 const (
@@ -179,6 +195,11 @@ func newBackoffFn(base, cap, jitter int) backoffFn {
 		// when set maxSleepMs >= 0 in `tikv.BackoffWithMaxSleep` will force sleep maxSleepMs milliseconds.
 		if maxSleepMs >= 0 && realSleep > maxSleepMs {
 			realSleep = maxSleepMs
+		}
+		if _, err := util.EvalFailpoint("fastBackoffBySkipSleep"); err == nil {
+			attempts++
+			lastSleep = sleep
+			return realSleep
 		}
 		select {
 		case <-time.After(time.Duration(realSleep) * time.Millisecond):
