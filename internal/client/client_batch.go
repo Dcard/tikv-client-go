@@ -945,7 +945,7 @@ func (c *batchCommandsClient) batchRecvLoop(cfg config.TiKVClient, tikvTransport
 			if val, err := util.EvalFailpoint("injectHealthFeedbackSlowScore"); err == nil {
 				v, ok := val.(int)
 				if !ok || v < 0 || v > 100 {
-					panic(fmt.Sprintf("invalid injection in failpoint injectHealthFeedbackSlowScore: %+q", v))
+					panic(fmt.Sprintf("invalid injection in failpoint injectHealthFeedbackSlowScore: %v", v))
 				}
 				resp.GetHealthFeedback().SlowScore = int32(v)
 			}

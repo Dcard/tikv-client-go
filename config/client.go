@@ -76,6 +76,9 @@ type TiKVClient struct {
 	// GrpcCompressionType is the compression type for gRPC channel: none or gzip.
 	GrpcCompressionType string `toml:"grpc-compression-type" json:"grpc-compression-type"`
 	// GrpcSharedBufferPool is the flag to control whether to share the buffer pool in the TiKV gRPC clients.
+	//
+	// Deprecated: this flag has no effect. Since gRPC v1.66 the client pools receive buffers
+	// with mem.DefaultBufferPool by default, and the WithRecvBufferPool option was removed.
 	GrpcSharedBufferPool bool `toml:"grpc-shared-buffer-pool" json:"grpc-shared-buffer-pool"`
 	// GrpcInitialWindowSize is the value for initial window size on a stream.
 	GrpcInitialWindowSize int32 `toml:"grpc-initial-window-size" json:"grpc-initial-window-size"`
